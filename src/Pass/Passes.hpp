@@ -96,6 +96,9 @@ void configureOnnxToKrnlLoweringPass(bool reportOnParallel,
 std::unique_ptr<mlir::Pass> createProcessScfParallelPrivatePass();
 std::unique_ptr<mlir::Pass> createProcessKrnlParallelClausePass();
 
+/// Pass for TensorSplitting
+std::unique_ptr<mlir::Pass> createTensorSplittingPass();
+
 #ifdef ONNX_MLIR_ENABLE_STABLEHLO
 /// Add pass for lowering to Stablehlo IR.
 std::unique_ptr<mlir::Pass> createLowerToStablehloPass();

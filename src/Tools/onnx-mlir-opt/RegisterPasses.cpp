@@ -134,6 +134,11 @@ void registerOMPasses(int optLevel) {
     return createConvertONNXToTOSAPass();
   });
 
+  /// TensorSplitting Pass
+  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+    return createTensorSplittingPass();
+  });
+
 #ifdef ONNX_MLIR_ENABLE_STABLEHLO
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
     return createLowerToStablehloPass();
