@@ -32,12 +32,14 @@ struct TensorSplittingPass
     func::FuncOp funcOp = getOperation();
     bool changed = true; // 변경 여부를 추적
 
-    // IR이 변경되는 동안 반복함. 변경이 없으면 루프를 종료
+    // peak op 분석, 최적화를 반복함. 최적화 불가능하면 루프 종료
     while (changed) {
       changed = false;
       Liveness &liveness = getAnalysis<Liveness>();
 
       Operation *peakOp = nullptr;
+      Operation *prePeakOp = nullptr;
+      Operation *postPeakOp = nullptr;
       int64_t maxMemoryUsage = -1;
 
       // peak memory인 op를 구함
@@ -50,23 +52,36 @@ struct TensorSplittingPass
         return WalkResult::advance();
       });
 
+      Value peakOpOperand = peakOp->getOperand(0);
+      prePeakOp = peakOpOperand.getDefiningOp(); // pwConv일때 최적화 가능
+      postPeakOp = *peakOp->getResult(0).getUsers().begin();
+
       if (!peakOp) {
         llvm::outs()
             << "[TensorSplittingPass] No peak op found or function is empty.\n";
         break;
       }
 
-      llvm::outs() << "[TensorSplittingPass] Peak op: " << *peakOp << "\n";
+      llvm::outs() << "[TensorSplittingPass] Pre peak op: " << *prePeakOp
+                   << "\n";
+      llvm::outs() << "                      Peak op: " << *peakOp << "\n";
+      llvm::outs() << "                      Post peak op: " << *postPeakOp
+                   << "\n";
 
-      if (!isOptimizable(peakOp)) {
+      if (!isOptimizable(prePeakOp)) {
         llvm::outs() << "[TensorSplittingPass] Peak op is not optimizable.\n";
         break;
       }
 
-      OpBuilder builder(peakOp->getContext());
+      OpBuilder builder(prePeakOp->getContext());
 
-      if (performTensorSplitting(peakOp, builder)) {
+      if (performTensorSplitting(prePeakOp, builder)) {
+        static int64_t optCount = 1;
         changed = true; // IR이 변경되었음을 표시
+        llvm::outs() << "[TensorSplittingPass] Optimization applied "
+                     << optCount << " time" << (optCount == 1 ? "" : "s")
+                     << ".\n\n";
+        optCount++;
         // IR이 변경되었으므로 Liveness 분석을 다시 실행해야 함.
         // 루프가 다시 시작될 때 getAnalysis<Liveness>()가 호출되어 갱신됨.
       } else {
@@ -98,7 +113,8 @@ private:
   }
 
   int64_t calculateMemoryUsageAtOp(Operation *op, Liveness &liveness) {
-    LivenessBlockInfo *blockLiveness = liveness.getLiveness(op->getBlock());
+    const LivenessBlockInfo *blockLiveness =
+        liveness.getLiveness(op->getBlock());
     if (!blockLiveness)
       return 0;
 
@@ -110,6 +126,7 @@ private:
       liveValuesSet.insert(val);
     }
     // op 자체의 결과도 추가
+    // liveValueSet에 이미 존재하더라도 set이라 중복 허용 안됨
     for (Value result : op->getResults()) {
       liveValuesSet.insert(result);
     }
@@ -122,22 +139,28 @@ private:
     return memoryUsage;
   }
 
-  // isOptimizable은 peakOp가 pointwise conv이고, 그 다음 depthwise conv (clip
-  // 포함일 수도 있음)가 오며, 중간 텐서가 최종 텐서보다 큰 경우를 확인함.
-  bool isOptimizable(Operation *peakOp) {
-    if (!isPointwiseConv(peakOp))
+  // isOptimizable은 prePeakOp가 pointwise conv이고, 그 다음 depthwise conv
+  // (clip 포함일 수도 있음)가 오며, 중간 텐서가 최종 텐서보다 큰 경우를 확인함.
+  bool isOptimizable(Operation *prePeakOp) {
+    if (!isPointwiseConv(prePeakOp)) {
+      llvm::outs() << "[TensorSplittingPass] Memory peak is not at the "
+                      "pointwise Conv.\n";
+      return false;
+    }
+
+    auto pwConv = llvm::dyn_cast<ONNXConvOp>(prePeakOp);
+    if (!pwConv)
       return false;
 
-    auto pwConv = llvm::dyn_cast<ONNXConvOp>(peakOp);
-    if (!pwConv || pwConv.getNumResults() == 0)
-      return false;
-
-    Value intermediateTensor = pwConv.getResult(0);
+    Value intermediateTensor = pwConv.getResult();
     Operation *nextOpAfterPw = nullptr;
 
     // pwConv의 출력이 하나의 연산에서만 사용되는지 확인
-    if (!intermediateTensor.hasOneUse())
+    if (!intermediateTensor.hasOneUse()) {
+      llvm::outs()
+          << "[TensorSplittingPass] Intermediate tensor has multiple uses.\n";
       return false;
+    }
 
     Operation *user = *intermediateTensor.getUsers().begin();
 
@@ -148,18 +171,33 @@ private:
         if (isDepthwiseConv(clipUser)) {
           nextOpAfterPw = clipUser;
         }
+      } else {
+        llvm::outs()
+            << "[TensorSplittingPass] Intermediate tensor has multiple uses.\n";
+        return false;
       }
     } else if (isDepthwiseConv(user)) {
       nextOpAfterPw = user;
     }
 
-    if (!nextOpAfterPw) // dwConv를 찾지 못함
+    if (!nextOpAfterPw) { // dwConv를 찾지 못함
+      llvm::outs() << "[TensorSplittingPass] No depthwise convolution after "
+                      "pointwise convolution.\n";
       return false;
+    }
 
     // isIntermediateLargerThanDepthwise 내부에서 pwConv와 nextOpAfterPw
     // (dwConv)를 사용
-    return isIntermediateLargerThanDepthwise(
+    bool larger = isIntermediateLargerThanDepthwise(
         pwConv, llvm::dyn_cast<ONNXConvOp>(nextOpAfterPw));
+    if (larger)
+      return true;
+    else {
+      llvm::outs() << "[TensorSplittingPass] Intermediate tensor is not larger "
+                      "than depthwise "
+                      "convolution's result tensor.\n";
+      return false;
+    }
   }
 
   bool isPointwiseConv(Operation *op) {
@@ -167,7 +205,7 @@ private:
     if (!convOp)
       return false;
 
-    Value kernel = convOp.W();
+    Value kernel = convOp.getOperand(1);
     auto kernelType = kernel.getType().dyn_cast<RankedTensorType>();
     if (!kernelType)
       return false;
@@ -184,14 +222,14 @@ private:
     if (!convOp)
       return false;
 
-    IntegerAttr groupAttr = convOp.groupAttr();
+    IntegerAttr groupAttr = convOp.getGroupAttr();
     if (!groupAttr)
       return false;
-    int64_t group = groupAttr.getInt();
+    int64_t group = groupAttr.getValue().getSExtValue();
     if (group <= 1)
       return false;
 
-    Value kernel = convOp.W();
+    Value kernel = convOp.getOperand(1);
     auto kernelType = kernel.getType().dyn_cast<RankedTensorType>();
     if (!kernelType || kernelType.getRank() < 2)
       return false;
@@ -200,7 +238,7 @@ private:
     if (kernelType.getShape()[1] != 1)
       return false;
 
-    Value inputX = convOp.X();
+    Value inputX = convOp.getOperand(0);
     auto inputType = inputX.getType().dyn_cast<RankedTensorType>();
     if (!inputType || inputType.getRank() < 2)
       return false;
@@ -233,7 +271,7 @@ private:
     return getTensorSize(intermediateType) > getTensorSize(dwResultType);
   }
 
-  // ONNXSplitOp를 생성하고 두 개의 출력 값을 반환하는 헬퍼 함수
+  // ONNXSplitOp를 생성하고 두 개의 출력 값을 반환하는 함수
   std::pair<Value, Value> createSplitOp(
       OpBuilder &builder, Location loc, Value input, int64_t axis = 0) {
     if (!input || input.getType().isa<NoneType>()) {
@@ -257,27 +295,31 @@ private:
     int64_t secondSize = totalSize - firstSize;
 
     // 출력 타입 추정
-    SmallVector<int64_t, 4> shapeA = shape;
+    SmallVector<int64_t, 4> shapeA(shape.begin(), shape.end());
     shapeA[axis] = firstSize;
-    SmallVector<int64_t, 4> shapeB = shape;
+    SmallVector<int64_t, 4> shapeB(shape.begin(), shape.end());
     shapeB[axis] = secondSize;
 
     Type typeA = RankedTensorType::get(shapeA, elementTy);
     Type typeB = RankedTensorType::get(shapeB, elementTy);
 
     // ONNXSplitOp 생성
+    // none type value
+    auto noneVal = builder.create<ONNXNoneOp>(loc).getResult();
+
     auto splitOp =
         builder.create<ONNXSplitOp>(loc, TypeRange{typeA, typeB}, input,
-            /*split=*/Value(), // split 텐서 사용 안 함
-            builder.getI64IntegerAttr(axis),
-            builder.getI64IntegerAttr(num_outputs) // num_outputs 방식 사용
+            noneVal, // split 텐서 사용 안 함
+            builder.getIntegerAttr(builder.getIntegerType(64, true), axis),
+            builder.getIntegerAttr(builder.getIntegerType(64, true),
+                num_outputs) // num_outputs 방식 사용
         );
 
     return {splitOp.getResult(0), splitOp.getResult(1)};
   }
 
-  bool performTensorSplitting(Operation *peakOp, OpBuilder &builder) {
-    ONNXConvOp pwConv = llvm::dyn_cast<ONNXConvOp>(peakOp);
+  bool performTensorSplitting(Operation *prePeakOp, OpBuilder &builder) {
+    ONNXConvOp pwConv = llvm::dyn_cast<ONNXConvOp>(prePeakOp);
     // isOptimizable 확인으로 인해 pwConv는 유효하다고 가정
 
     Location loc = pwConv.getLoc();
@@ -318,12 +360,12 @@ private:
     }
 
     // 2. 피연산자 및 속성 가져오기
-    Value X_pw = pwConv.X();
-    Value W_pw_orig = pwConv.W();
-    Value B_pw_orig = pwConv.B();
+    Value X_pw = pwConv.getOperand(0);
+    Value W_pw_orig = pwConv.getOperand(1);
+    Value B_pw_orig = pwConv.getOperand(2);
 
-    Value W_dw_orig = dwConvNode.W();
-    Value B_dw_orig = dwConvNode.B();
+    Value W_dw_orig = dwConvNode.getOperand(1);
+    Value B_dw_orig = dwConvNode.getOperand(2);
 
     auto wPwType = W_pw_orig.getType().cast<RankedTensorType>();
     // pwConv 가중치 형태: [M, C_in_pw, 1, 1]
@@ -385,44 +427,70 @@ private:
 
     // 속성 가져오기, dwConv의 group 수정 (A, B 각각 다른 그룹 수)
     NamedAttrList pwConvAttrs(pwConv->getAttrs());
+    // group attr 타입 맞추기기
+    SmallVector<NamedAttribute, 8> newPwConvAttrs;
+    for (const NamedAttribute &attr : pwConvAttrs) {
+      if (attr.getName().getValue() == "group") {
+        auto intAttr = attr.getValue().dyn_cast<IntegerAttr>();
+        if (intAttr) {
+          // 'group' 속성을 si64 타입으로 명시적으로 생성
+          newPwConvAttrs.push_back(builder.getNamedAttr(
+              "group", builder.getIntegerAttr(builder.getIntegerType(64, true),
+                           intAttr.getSInt())));
+        } else {
+          newPwConvAttrs.push_back(attr); // 예외 처리
+        }
+      } else {
+        newPwConvAttrs.push_back(attr);
+      }
+    }
     NamedAttrList dwConvAttrsSplitA(dwConvNode->getAttrs());
-    dwConvAttrsSplitA.set(
-        builder.getIdentifier("group"), builder.getI64IntegerAttr(M_A));
+    dwConvAttrsSplitA.set(builder.getStringAttr("group"),
+        builder.getIntegerAttr(builder.getIntegerType(64, true), M_A));
     NamedAttrList dwConvAttrsSplitB(dwConvNode->getAttrs());
-    dwConvAttrsSplitB.set(
-        builder.getIdentifier("group"), builder.getI64IntegerAttr(M_B));
+    dwConvAttrsSplitB.set(builder.getStringAttr("group"),
+        builder.getIntegerAttr(builder.getIntegerType(64, true), M_B));
 
     // --- 경로 A 생성 ---
     builder.setInsertionPoint(pwConv);
-    ONNXConvOp newPwConvA = builder.create<ONNXConvOp>(
-        loc, splitPwConvOutType, X_pw, W_pw_A, B_pw_A, pwConvAttrs);
+    ONNXConvOp newPwConvA = builder.create<ONNXConvOp>(loc,
+        TypeRange{splitPwConvOutTypeA}, ValueRange{X_pw, W_pw_A, B_pw_A},
+        ArrayRef<NamedAttribute>{newPwConvAttrs.begin(), newPwConvAttrs.end()});
     Value interAResult = newPwConvA.getResult();
 
     if (clipOpNode) {
-      ONNXClipOp newClipA = builder.create<ONNXClipOp>(loc, splitPwConvOutType,
-          interAResult, clipOpNode.minAttr(), clipOpNode.maxAttr());
+      ONNXClipOp newClipA = builder.create<ONNXClipOp>(loc, splitPwConvOutTypeA,
+          interAResult, clipOpNode.getMin(), clipOpNode.getMax());
       interAResult = newClipA.getResult();
     }
 
-    ONNXConvOp newDwConvA = builder.create<ONNXConvOp>(loc, splitDwConvOutType,
-        interAResult, W_dw_A, B_dw_A, dwConvAttrsSplit);
+    ONNXConvOp newDwConvA =
+        builder.create<ONNXConvOp>(loc, TypeRange{splitDwConvOutTypeA},
+            ValueRange{interAResult, W_dw_A, B_dw_A},
+            ArrayRef<NamedAttribute>{
+                dwConvAttrsSplitA.begin(), dwConvAttrsSplitA.end()});
 
     // --- 경로 B 생성 ---
-    ONNXConvOp newPwConvB = builder.create<ONNXConvOp>(
-        loc, splitPwConvOutType, X_pw, W_pw_B, B_pw_B, pwConvAttrs);
+    ONNXConvOp newPwConvB = builder.create<ONNXConvOp>(loc,
+        TypeRange{splitPwConvOutTypeB}, ValueRange{X_pw, W_pw_B, B_pw_B},
+        ArrayRef<NamedAttribute>{pwConvAttrs.begin(), pwConvAttrs.end()});
     Value interBResult = newPwConvB.getResult();
 
     if (clipOpNode) {
-      ONNXClipOp newClipB = builder.create<ONNXClipOp>(loc, splitPwConvOutType,
-          interBResult, clipOpNode.minAttr(), clipOpNode.maxAttr());
+      ONNXClipOp newClipB = builder.create<ONNXClipOp>(loc, splitPwConvOutTypeB,
+          interBResult, clipOpNode.getMin(), clipOpNode.getMax());
       interBResult = newClipB.getResult();
     }
 
-    ONNXConvOp newDwConvB = builder.create<ONNXConvOp>(loc, splitDwConvOutType,
-        interBResult, W_dw_B, B_dw_B, dwConvAttrsSplit);
+    ONNXConvOp newDwConvB =
+        builder.create<ONNXConvOp>(loc, TypeRange{splitDwConvOutTypeB},
+            ValueRange{interBResult, W_dw_B, B_dw_B},
+            ArrayRef<NamedAttribute>{
+                dwConvAttrsSplitB.begin(), dwConvAttrsSplitB.end()});
 
     // 5. 결과 연결
-    IntegerAttr concatAxisAttr = builder.getI64IntegerAttr(1); // NCHW 채널 축
+    IntegerAttr concatAxisAttr = builder.getIntegerAttr(
+        builder.getIntegerType(64, true), 1); // NCHW 채널 축
     ONNXConcatOp concatOp = builder.create<ONNXConcatOp>(loc, dwConvOutTypeFull,
         ValueRange{newDwConvA.getResult(), newDwConvB.getResult()},
         concatAxisAttr);
