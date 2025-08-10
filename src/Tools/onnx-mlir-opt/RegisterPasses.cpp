@@ -139,6 +139,12 @@ void registerOMPasses(int optLevel) {
     return createTensorSplittingPass();
   });
 
+  /// Peak Memory Analysis
+  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+    return createPeakMemoryAnalysis();
+  });
+
+
 #ifdef ONNX_MLIR_ENABLE_STABLEHLO
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
     return createLowerToStablehloPass();

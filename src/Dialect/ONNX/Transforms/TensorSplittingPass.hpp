@@ -1,5 +1,5 @@
-#ifndef ONNX_MLIR_TESTONNXPASS_HPP
-#define ONNX_MLIR_TESTONNXPASS_HPP
+#ifndef ONNX_MLIR_TENSORSPLITTINGPASS_HPP
+#define ONNX_MLIR_TENSORSPLITTINGPASS_HPP
 
 #include "mlir/Pass/Pass.h" // PassWrapper class, OperationPass template
 #include <memory> // utilities for managing dynamic memory like std::unique_ptr
