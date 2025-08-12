@@ -1,20 +1,25 @@
-#include "mlir/Analysis/Liveness.h"
-#include "mlir/IR/Builders.h"
-#include "mlir/IR/BuiltinAttributes.h"
-#include "mlir/IR/BuiltinOps.h"
-#include "mlir/IR/BuiltinTypes.h"
-#include "mlir/IR/Matchers.h"
-#include "mlir/IR/PatternMatch.h"
-#include "mlir/Pass/Pass.h"
-
-#include "src/Dialect/ONNX/DialectBuilder.hpp"
-#include "src/Dialect/ONNX/ONNXOps.hpp"
-#include "src/Dialect/ONNX/ONNXOps/OpHelper.hpp"
-#include "src/Pass/Passes.hpp"
-
-#include "llvm/ADT/SmallVector.h"
-
 #include <fstream>
+
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringRef.h"
+#include "llvm/Support/raw_ostream.h"
+
+#include "mlir/Analysis/Liveness.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/IR/Attributes.h"
+#include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/Builders.h"
+#include "mlir/IR/Operation.h"
+#include "mlir/IR/Types.h"
+#include "mlir/Pass/Pass.h"
+#include "mlir/Support/LLVM.h"
+
+// ONNX ops
+#include "src/Dialect/ONNX/ONNXOps.hpp"
+
 using namespace mlir;
 
 namespace {
@@ -132,8 +137,8 @@ private:
     unsigned elementBitWidth;
     if (elementType.isIntOrIndex()) {
       elementBitWidth = elementType.getIntOrFloatBitWidth();
-    } else if (elementType.isa<FloatType>()) {
-      elementBitWidth = elementType.cast<FloatType>().getWidth();
+    } else if (isa<FloatType>(elementType)) {
+      elementBitWidth = cast<FloatType>(elementType).getWidth();
     } else {
       // llvm::errs() << "Unsupported element type: " << elementType << "\n";
       return 0;
@@ -168,7 +173,7 @@ private:
       liveValuesSet.insert(result);
     }
     for (Value val : liveValuesSet) {
-      if (auto tensorType = val.getType().dyn_cast<TensorType>()) {
+      if (auto tensorType = dyn_cast<TensorType>(val.getType())) {
         memoryUsage += getTensorSize(tensorType);
       }
     }
@@ -231,7 +236,7 @@ private:
     if (!convOp)
       return false;
     Value kernel = convOp.getOperand(1);
-    auto kernelType = kernel.getType().dyn_cast<RankedTensorType>();
+    auto kernelType = dyn_cast<RankedTensorType>(kernel.getType());
     if (!kernelType)
       return false;
     ArrayRef<int64_t> shape = kernelType.getShape();
@@ -250,13 +255,13 @@ private:
     if (group <= 1)
       return false;
     Value kernel = convOp.getOperand(1);
-    auto kernelType = kernel.getType().dyn_cast<RankedTensorType>();
+    auto kernelType = dyn_cast<RankedTensorType>(kernel.getType());
     if (!kernelType || kernelType.getRank() < 2)
       return false;
     if (kernelType.getShape()[1] != 1)
       return false;
     Value inputX = convOp.getOperand(0);
-    auto inputType = inputX.getType().dyn_cast<RankedTensorType>();
+    auto inputType = dyn_cast<RankedTensorType>(inputX.getType());
     if (!inputType || inputType.getRank() < 2)
       return false;
     int64_t C_in = inputType.getShape()[1];
@@ -269,12 +274,12 @@ private:
       return false;
     Value intermediateTensor = pwConvOp.getResult();
     Value dwResult = dwConvOp.getResult();
-    if (!intermediateTensor || intermediateTensor.getType().isa<NoneType>() ||
-        !dwResult || dwResult.getType().isa<NoneType>()) {
+    if (!intermediateTensor || isa<NoneType>(intermediateTensor.getType()) ||
+        !dwResult || isa<NoneType>(dwResult.getType())) {
       return false;
     }
-    auto intermediateType = intermediateTensor.getType().dyn_cast<TensorType>();
-    auto dwResultType = dwResult.getType().dyn_cast<TensorType>();
+    auto intermediateType = dyn_cast<TensorType>(intermediateTensor.getType());
+    auto dwResultType = dyn_cast<TensorType>(dwResult.getType());
     if (!intermediateType || !dwResultType)
       return false;
     return getTensorSize(intermediateType) > getTensorSize(dwResultType);
@@ -282,25 +287,29 @@ private:
 
   std::pair<Value, Value> createSplitOp(
       OpBuilder &builder, Location loc, Value input, int64_t axis = 0) {
-    if (!input || input.getType().isa<NoneType>()) {
+    if (!input || isa<NoneType>(input.getType())) {
       Value none = builder.create<ONNXNoneOp>(loc).getResult();
       return {none, none};
     }
-    auto inputType = input.getType().dyn_cast<RankedTensorType>();
+    auto inputType = dyn_cast<RankedTensorType>(input.getType());
     if (!inputType || inputType.getRank() <= axis)
       return {nullptr, nullptr};
     auto shape = inputType.getShape();
     auto elementTy = inputType.getElementType();
+
     int64_t num_outputs = 2;
     int64_t totalSize = shape[axis];
     int64_t firstSize = totalSize / num_outputs;
     int64_t secondSize = totalSize - firstSize;
+
     SmallVector<int64_t, 4> shapeA(shape.begin(), shape.end());
     shapeA[axis] = firstSize;
     SmallVector<int64_t, 4> shapeB(shape.begin(), shape.end());
     shapeB[axis] = secondSize;
+
     Type typeA = RankedTensorType::get(shapeA, elementTy);
     Type typeB = RankedTensorType::get(shapeB, elementTy);
+
     auto noneVal = builder.create<ONNXNoneOp>(loc).getResult();
     auto splitOp = builder.create<ONNXSplitOp>(loc, TypeRange{typeA, typeB},
         input, noneVal,
@@ -312,10 +321,12 @@ private:
   bool performTensorSplitting(Operation *prePeakOp, OpBuilder &builder) {
     ONNXConvOp pwConv = llvm::dyn_cast<ONNXConvOp>(prePeakOp);
     Location loc = pwConv.getLoc();
+
     Value intermediateTensor = pwConv.getResult();
     ONNXClipOp clipOpNode = nullptr;
     ONNXConvOp dwConvNode = nullptr;
     Operation *dwConvOperationForInsertion = nullptr;
+
     bool patternFound = false;
     if (intermediateTensor.hasOneUse()) {
       Operation *userOfPwConv = *intermediateTensor.getUsers().begin();
@@ -342,14 +353,18 @@ private:
     if (!patternFound) {
       return false;
     }
+
     Value X_pw = pwConv.getOperand(0);
     Value W_pw_orig = pwConv.getOperand(1);
     Value B_pw_orig = pwConv.getOperand(2);
     Value W_dw_orig = dwConvNode.getOperand(1);
     Value B_dw_orig = dwConvNode.getOperand(2);
-    auto wPwType = W_pw_orig.getType().cast<RankedTensorType>();
+
+    auto wPwType = cast<RankedTensorType>(W_pw_orig.getType());
     int64_t M = wPwType.getShape()[0];
+
     builder.setInsertionPoint(pwConv);
+
     auto [W_pw_A, W_pw_B] = createSplitOp(builder, loc, W_pw_orig, 0);
     auto [B_pw_A, B_pw_B] = createSplitOp(builder, loc, B_pw_orig, 0);
     auto [W_dw_A, W_dw_B] = createSplitOp(builder, loc, W_dw_orig, 0);
@@ -357,11 +372,14 @@ private:
     if (!W_pw_A || !W_pw_B || !W_dw_A || !W_dw_B) {
       return false;
     }
+
     int64_t M_B = M / 2;
     int64_t M_A = M - M_B;
-    auto pwOrigOutType = intermediateTensor.getType().cast<RankedTensorType>();
+
+    auto pwOrigOutType = cast<RankedTensorType>(intermediateTensor.getType());
     auto pwShape = pwOrigOutType.getShape();
     auto pwElementType = pwOrigOutType.getElementType();
+
     SmallVector<int64_t, 4> splitPwShape(pwShape.begin(), pwShape.end());
     splitPwShape[1] = M_A;
     Type splitPwConvOutTypeA =
@@ -369,10 +387,12 @@ private:
     splitPwShape[1] = M_B;
     Type splitPwConvOutTypeB =
         RankedTensorType::get(splitPwShape, pwElementType);
+
     auto dwOrigOutType =
-        dwConvNode.getResult().getType().cast<RankedTensorType>();
+        cast<RankedTensorType>(dwConvNode.getResult().getType());
     auto dwShape = dwOrigOutType.getShape();
     auto dwElementType = dwOrigOutType.getElementType();
+
     SmallVector<int64_t, 4> splitDwShape(dwShape.begin(), dwShape.end());
     splitDwShape[1] = M_A;
     Type splitDwConvOutTypeA =
@@ -380,12 +400,14 @@ private:
     splitDwShape[1] = M_B;
     Type splitDwConvOutTypeB =
         RankedTensorType::get(splitDwShape, dwElementType);
+
     Type dwConvOutTypeFull = dwOrigOutType;
+
     NamedAttrList pwConvAttrs(pwConv->getAttrs());
     SmallVector<NamedAttribute, 8> newPwConvAttrs;
     for (const NamedAttribute &attr : pwConvAttrs) {
       if (attr.getName().getValue() == "group") {
-        auto intAttr = attr.getValue().dyn_cast<IntegerAttr>();
+        auto intAttr = dyn_cast<IntegerAttr>(attr.getValue());
         if (intAttr) {
           newPwConvAttrs.push_back(builder.getNamedAttr(
               "group", builder.getIntegerAttr(builder.getIntegerType(64, true),
@@ -397,57 +419,71 @@ private:
         newPwConvAttrs.push_back(attr);
       }
     }
+
     NamedAttrList dwConvAttrsSplitA(dwConvNode->getAttrs());
     dwConvAttrsSplitA.set(builder.getStringAttr("group"),
         builder.getIntegerAttr(builder.getIntegerType(64, true), M_A));
     NamedAttrList dwConvAttrsSplitB(dwConvNode->getAttrs());
     dwConvAttrsSplitB.set(builder.getStringAttr("group"),
         builder.getIntegerAttr(builder.getIntegerType(64, true), M_B));
+
     builder.setInsertionPoint(pwConv);
+
     ONNXConvOp newPwConvA = builder.create<ONNXConvOp>(loc,
         TypeRange{splitPwConvOutTypeA}, ValueRange{X_pw, W_pw_A, B_pw_A},
         ArrayRef<NamedAttribute>{newPwConvAttrs.begin(), newPwConvAttrs.end()});
     Value interAResult = newPwConvA.getResult();
+
     if (clipOpNode) {
       ONNXClipOp newClipA = builder.create<ONNXClipOp>(loc, splitPwConvOutTypeA,
           interAResult, clipOpNode.getMin(), clipOpNode.getMax());
       interAResult = newClipA.getResult();
     }
+
     ONNXConvOp newDwConvA =
         builder.create<ONNXConvOp>(loc, TypeRange{splitDwConvOutTypeA},
             ValueRange{interAResult, W_dw_A, B_dw_A},
             ArrayRef<NamedAttribute>{
                 dwConvAttrsSplitA.begin(), dwConvAttrsSplitA.end()});
+
     ONNXConvOp newPwConvB = builder.create<ONNXConvOp>(loc,
         TypeRange{splitPwConvOutTypeB}, ValueRange{X_pw, W_pw_B, B_pw_B},
         ArrayRef<NamedAttribute>{pwConvAttrs.begin(), pwConvAttrs.end()});
     Value interBResult = newPwConvB.getResult();
+
     if (clipOpNode) {
       ONNXClipOp newClipB = builder.create<ONNXClipOp>(loc, splitPwConvOutTypeB,
           interBResult, clipOpNode.getMin(), clipOpNode.getMax());
       interBResult = newClipB.getResult();
     }
+
     ONNXConvOp newDwConvB =
         builder.create<ONNXConvOp>(loc, TypeRange{splitDwConvOutTypeB},
             ValueRange{interBResult, W_dw_B, B_dw_B},
             ArrayRef<NamedAttribute>{
                 dwConvAttrsSplitB.begin(), dwConvAttrsSplitB.end()});
+
     IntegerAttr concatAxisAttr =
         builder.getIntegerAttr(builder.getIntegerType(64, true), 1);
+
     ONNXConcatOp concatOp = builder.create<ONNXConcatOp>(loc, dwConvOutTypeFull,
         ValueRange{newDwConvA.getResult(), newDwConvB.getResult()},
         concatAxisAttr);
+
     dwConvNode.getResult().replaceAllUsesWith(concatOp.getResult());
     assert(dwConvNode.getOperation()->use_empty() &&
            "dwConv should have no users");
     dwConvNode.getOperation()->erase();
+
     if (clipOpNode) {
       assert(clipOpNode.getOperation()->use_empty() &&
              "clipOp should have no users");
       clipOpNode.getOperation()->erase();
     }
+
     assert(pwConv.getOperation()->use_empty() && "pwConv should have no users");
     pwConv.getOperation()->erase();
+
     return true;
   }
 }; // struct TensorSplittingPass

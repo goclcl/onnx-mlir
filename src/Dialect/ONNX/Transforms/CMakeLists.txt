@@ -114,28 +114,27 @@ add_onnx_mlir_library(OMTensorSplittingPass
   TensorSplittingPass.cpp
 
   LINK_LIBS PUBLIC
-  MLIRTransformUtils           # 패턴 매칭 등
-  MLIRFuncDialect              # func dialect 사용
-  MLIRAnalysis                 # Liveness.h
-  MLIRIR                       # BuiltinTypes, IR 관련
-  MLIRPass                    # pass 등록
-  MLIRSupport                 # LLVM ADT 포함
-  OMONNXOps                   # ONNX 연산 사용
-  OMShapeInference            # shape inference 호출
-  OMSupport                   # DialectBuilder 등 유�
-  )
+    MLIRTransformUtils          # 패턴 매칭 등
+    MLIRFuncDialect             # func dialect 사용
+    MLIRAnalysis                # Liveness.h
+    MLIRIR                      # BuiltinTypes, IR 관련
+    MLIRPass                    # pass 등록
+    MLIRSupport                 # LLVM ADT 포함
+    MLIRTransforms              # GreedyPatternRewriteDriver 등 변환 패스 필요 시
+    OMONNXOps                   # ONNX 연산 사용
+    OMShapeInference            # shape inference 호출
+    OMSupport                   # DialectBuilder 등 유틸
+)
 
-  add_onnx_mlir_library(OMPeakMemoryAnalysis
+add_onnx_mlir_library(OMPeakMemoryAnalysis
   PeakMemoryAnalysis.cpp
 
   LINK_LIBS PUBLIC
-  MLIRTransformUtils           # 패턴 매칭 등
-  MLIRFuncDialect              # func dialect 사용
-  MLIRAnalysis                 # Liveness.h
-  MLIRIR                       # BuiltinTypes, IR 관련
-  MLIRPass                    # pass 등록
-  MLIRSupport                 # LLVM ADT 포함
-  OMONNXOps                   # ONNX 연산 사용
-  OMShapeInference            # shape inference 호출
-  OMSupport                   # DialectBuilder 등 유�
-  )
+  MLIRFuncDialect          # func::FuncOp 사용
+  MLIRAnalysis             # Liveness 등 Analysis
+  MLIRIR                   # IR Core (BuiltinTypes 등)
+  MLIRPass                 # Pass 등록
+  MLIRSupport              # LLVM ADT 포함
+  OMONNXOps                # ONNX 연산
+)
+

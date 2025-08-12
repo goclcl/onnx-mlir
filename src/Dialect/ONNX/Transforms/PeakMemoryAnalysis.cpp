@@ -1,20 +1,21 @@
+#include <system_error>
+
+#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/Support/raw_ostream.h"
+
 #include "mlir/Analysis/Liveness.h"
-#include "mlir/IR/Builders.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/IR/Attributes.h"
 #include "mlir/IR/BuiltinAttributes.h"
-#include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
-#include "mlir/IR/Matchers.h"
-#include "mlir/IR/PatternMatch.h"
+#include "mlir/IR/Builders.h"
+#include "mlir/IR/Operation.h"
+#include "mlir/IR/Types.h"
 #include "mlir/Pass/Pass.h"
+#include "mlir/Support/LLVM.h" // isa/dyn_cast/cast
 
-#include "src/Dialect/ONNX/DialectBuilder.hpp"
+// ONNX ops
 #include "src/Dialect/ONNX/ONNXOps.hpp"
-#include "src/Dialect/ONNX/ONNXOps/OpHelper.hpp"
-#include "src/Pass/Passes.hpp"
-
-#include "llvm/ADT/SmallVector.h"
-
-#include <fstream>
 
 using namespace mlir;
 
@@ -32,21 +33,21 @@ struct PeakMemoryAnalysis
   }
 
   void runOnOperation() override {
-  func::FuncOp funcOp = getOperation();
-  Liveness &liveness = getAnalysis<Liveness>();
+    func::FuncOp funcOp = getOperation();
+    Liveness &liveness = getAnalysis<Liveness>();
 
-  Operation *peakOp = nullptr;
-  int64_t maxMemoryUsage = -1;
+    Operation *peakOp = nullptr;
+    int64_t maxMemoryUsage = -1;
 
-  // 로그 파일 (상수 포함)
-  std::error_code ec1;
-  llvm::raw_fd_ostream logFileWithConstants("memory_report.txt", ec1);
-  if (ec1) {
-    llvm::errs() << "Error opening log file (with constants): " << ec1.message() << "\n";
-    return;
-  }
+    // 로그 파일 (상수 포함)
+    std::error_code ec1;
+    llvm::raw_fd_ostream logFileWithConstants("memory_report.txt", ec1);
+    if (ec1) {
+      llvm::errs() << "Error opening log file (with constants): " << ec1.message() << "\n";
+      return;
+    }
 
-  // 로그 파일 (상수 제외)
+    // 로그 파일 (상수 제외)
     std::error_code ec2;
     llvm::raw_fd_ostream logFileWithoutConstants("memory_report_no_constants.txt", ec2);
     if (ec2) {
@@ -54,20 +55,19 @@ struct PeakMemoryAnalysis
       return;
     }
 
+    logFileWithConstants << "Operation-wise Memory Usage Report (with Constants)\n";
+    logFileWithConstants << "====================================================\n";
+    logFileWithoutConstants << "Operation-wise Memory Usage Report (without Constants)\n";
+    logFileWithoutConstants << "=======================================================\n";
 
-  logFileWithConstants << "Operation-wise Memory Usage Report (with Constants)\n";
-  logFileWithConstants << "====================================================\n";
-  logFileWithoutConstants << "Operation-wise Memory Usage Report (without Constants)\n";
-  logFileWithoutConstants << "=======================================================\n";
+    // 모든 연산에 대해 메모리 사용량 계산 및 기록 (onnx.Constant 제외)
+    funcOp.walk([&](Operation *op) {
+      // onnx.Constant와 func.func op는 스킵함
+      if (mlir::isa<mlir::ONNXConstantOp>(op) || mlir::isa<mlir::func::FuncOp>(op))
+        return;
 
-  // 모든 연산에 대해 메모리 사용량 계산 및 기록 (onnx.Constant 제외)
-  funcOp.walk([&](Operation *op) {
-    // onnx.Constant와 func.func op는 스킵함
-    if (isa<mlir::ONNXConstantOp>(op)|| isa<mlir::func::FuncOp>(op))
-      return;
-
-    // 1. 상수 포함해서 메모리 계산&로깅
-    int64_t usageWithConstants = calculateMemoryUsageAtOp(op, liveness, false);
+      // 1. 상수 포함해서 메모리 계산&로깅
+      int64_t usageWithConstants = calculateMemoryUsageAtOp(op, liveness, /*excludeConstants=*/false);
       logFileWithConstants << "Memory: " << usageWithConstants << " bytes | Op: ";
       op->print(logFileWithConstants);
       logFileWithConstants << "\n---------------------------------\n";
@@ -84,11 +84,10 @@ struct PeakMemoryAnalysis
       op->print(logFileWithoutConstants);
       logFileWithoutConstants << "\n---------------------------------\n";
       // =============================================================
-  });
+    });
 
-
-  // Peak memory 결과를 콘솔과 로그 파일에 출력
-  if (peakOp) {
+    // Peak memory 결과를 콘솔과 로그 파일에 출력
+    if (peakOp) {
       // 1. 콘솔과 상수 포함 로그 파일에 결과 출력
       llvm::outs() << "[PeakMemoryAnalysis] Peak memory usage: "
                    << maxMemoryUsage << " bytes\n";
@@ -101,8 +100,8 @@ struct PeakMemoryAnalysis
 
       // 2. 상수 제외 로그 파일에 상수 포함한 분석의 peak op 정보 추가
       // peakOp 시점의 메모리 사용량을 상수 제외 기준으로 다시 계산
-      int64_t peakOpUsageWithoutConstants = calculateMemoryUsageAtOp(peakOp, liveness, true);
-      
+      int64_t peakOpUsageWithoutConstants = calculateMemoryUsageAtOp(peakOp, liveness, /*excludeConstants=*/true);
+
       // peak op자체는 상수를 포함 했을때의 peak op이고,
       // usage는 해당 op의 상수를 제외 했을때의 계산 결과임
       logFileWithoutConstants << "\n\nPeak Memory Usage: " << peakOpUsageWithoutConstants << " bytes\n";
@@ -113,8 +112,7 @@ struct PeakMemoryAnalysis
     } else {
       llvm::outs() << "[PeakMemoryAnalysis] No operation found.\n";
     }
-}
-
+  }
 
 private:
   /// 주어진 TensorType의 메모리 크기를 byte 단위로 계산
@@ -131,7 +129,7 @@ private:
     if (elementType.isIntOrIndex()) {
       // 정수 또는 index 타입인 경우
       bitWidth = elementType.getIntOrFloatBitWidth();
-    } else if (auto floatType = elementType.dyn_cast<FloatType>()) {
+    } else if (auto floatType = mlir::dyn_cast<FloatType>(elementType)) {
       // float 타입인 경우
       bitWidth = floatType.getWidth();
     } else {
@@ -181,7 +179,7 @@ private:
       if (excludeConstants && defOp && mlir::isa<ONNXConstantOp>(defOp))
         continue;
 
-      if (auto tensorType = val.getType().dyn_cast<TensorType>())
+      if (auto tensorType = mlir::dyn_cast<TensorType>(val.getType()))
         memoryUsage += getTensorSize(tensorType);
     }
 
