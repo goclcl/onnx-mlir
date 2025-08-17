@@ -97,6 +97,17 @@ struct PeakMemoryAnalysis
       logFileWithConstants << "At Operation:\n";
       peakOp->print(logFileWithConstants);
       logFileWithConstants << "\n";
+      // peak 시점에 살아있는 value들 출력
+      logFileWithConstants << "Live value lists:" << "\n";
+      const LivenessBlockInfo *blockLiveness =
+        liveness.getLiveness(peakOp->getBlock());
+      for (Value val : blockLiveness->currentlyLiveValues(peakOp)) {
+        Operation *defOp = val.getDefiningOp();
+        if (defOp && mlir::isa<ONNXConstantOp>(defOp))
+        continue;
+        logFileWithConstants << val << "\n";
+      }
+
 
       // 2. 상수 제외 로그 파일에 상수 포함한 분석의 peak op 정보 추가
       // peakOp 시점의 메모리 사용량을 상수 제외 기준으로 다시 계산
