@@ -96,6 +96,12 @@ void configureOnnxToKrnlLoweringPass(bool reportOnParallel,
 std::unique_ptr<mlir::Pass> createProcessScfParallelPrivatePass();
 std::unique_ptr<mlir::Pass> createProcessKrnlParallelClausePass();
 
+/// Peak Memory Optimization
+std::unique_ptr<mlir::Pass> createPeakMemOptPass();
+
+/// Peak Memory Analysis
+std::unique_ptr<mlir::Pass> createPeakMemoryAnalysis();
+
 #ifdef ONNX_MLIR_ENABLE_STABLEHLO
 /// Add pass for lowering to Stablehlo IR.
 std::unique_ptr<mlir::Pass> createLowerToStablehloPass();

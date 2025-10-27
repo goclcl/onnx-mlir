@@ -109,3 +109,32 @@ add_onnx_mlir_library(OMONNXStandardFuncReturnPass
   OMONNXOps
   OMShapeInference
   )
+
+add_onnx_mlir_library(OMPeakMemOptPass
+  PeakMemOptPass.cpp
+
+  LINK_LIBS PUBLIC
+    MLIRIR
+    MLIRSupport
+    MLIRPass
+    MLIRAnalysis
+    MLIRFuncDialect
+    MLIRTransformUtils
+    MLIRTransforms
+    OMONNXOps
+    OMShapeInference
+    OMSupport
+)
+
+add_onnx_mlir_library(OMPeakMemoryAnalysis
+  PeakMemoryAnalysis.cpp
+
+  LINK_LIBS PUBLIC
+  MLIRFuncDialect          # func::FuncOp 사용
+  MLIRAnalysis             # Liveness 등 Analysis
+  MLIRIR                   # IR Core (BuiltinTypes 등)
+  MLIRPass                 # Pass 등록
+  MLIRSupport              # LLVM ADT 포함
+  OMONNXOps                # ONNX 연산
+)
+

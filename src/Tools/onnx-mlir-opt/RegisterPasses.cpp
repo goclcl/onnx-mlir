@@ -134,6 +134,15 @@ void registerOMPasses(int optLevel) {
     return createConvertONNXToTOSAPass();
   });
 
+  /// PeakMemoryOptimization Pass
+  mlir::registerPass(
+      []() -> std::unique_ptr<mlir::Pass> { return createPeakMemOptPass(); });
+
+  /// Peak Memory Analysis
+  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+    return createPeakMemoryAnalysis();
+  });
+
 #ifdef ONNX_MLIR_ENABLE_STABLEHLO
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
     return createLowerToStablehloPass();
