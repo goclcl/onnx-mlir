@@ -6,6 +6,7 @@
 
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include "mlir/Analysis/Liveness.h"
@@ -14,6 +15,7 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/Dominance.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/Types.h"
 #include "mlir/Pass/Pass.h"
@@ -36,6 +38,8 @@ struct PeakMemOptPass
   void runOnOperation() override {
     func::FuncOp funcOp = getOperation();
     Liveness &liveness = getAnalysis<Liveness>();
+    // auto &dominence = getAnalysis<mlir::DominanceInfo>();
+    // auto &postDominance = getAnalysis<mlir::PostDominanceInfo>();
 
     /* ===============Peak 탐색=============== */
     Operation *peakOp = nullptr;
@@ -64,6 +68,8 @@ struct PeakMemOptPass
     llvm::outs() << "\n";
 
     /* ===============Optimizable Patterns 탐색=============== */
+
+    /* ---------------Expand/Shrink--------------- */
     Operation *s = nullptr;
     Operation *e = nullptr;
     const uint32_t DETECTION_SCOPE = 64;
@@ -74,14 +80,29 @@ struct PeakMemOptPass
     bool matched = matchExpandShrinkPattern(peakOp, s, e, DETECTION_SCOPE);
 
     if (!matched) {
-      llvm::outs() << "[match] no window\n";
+      llvm::outs() << "[match Expand/Shrink] no window\n";
     } else {
-      llvm::outs() << "[match] SPLITTABLE window: S=";
+      llvm::outs() << "[match Expand/Shrink] SPLITTABLE window: S=";
       printOpOneLine(s);
       llvm::outs() << "  E=";
       printOpOneLine(e);
       llvm::outs() << "\n";
     }
+    /* ---------------Expand/Shrink--------------- */
+
+    /* ---------------Fork/Join--------------- */
+    IsolatedSubgraph isolatedSubgraph;
+
+    if (findIsolatedSubgraph(peakOp, funcOp, isolatedSubgraph)) {
+      llvm::outs() << "[match Fork/Merge] SPLITTABLE window: S=";
+      printOpOneLine(isolatedSubgraph.entryGate);
+      llvm::outs() << "  E=";
+      printOpOneLine(isolatedSubgraph.exitGate);
+      llvm::outs() << "\n";
+    } else {
+      llvm::outs() << "[match Fork/Merge] no window\n";
+    }
+    /* ---------------Fork/Join--------------- */
   }
 
 private:
@@ -510,12 +531,261 @@ private:
     // 최적화로 얻는 이득은 얼마인지?(peak memory reduction)
   }
 
-  bool matchForkJoinPattern(Operation *op, uint32_t detectionScope) {
+  struct IsolatedSubgraph {
+    Operation *entryGate = nullptr; // S (must be branching; fanout>=2)
+    Operation *exitGate = nullptr;  // E
+    llvm::SmallVector<Operation *, 256> nodes;
+  };
+
+  // -------------------- helpers --------------------
+  static inline unsigned countDistinctUsers(Operation *op) {
+    llvm::SmallPtrSet<Operation *, 16> uniq;
+    for (Value r : op->getResults())
+      for (Operation *u : r.getUsers())
+        uniq.insert(u);
+    return (unsigned)uniq.size();
+  }
+  static inline bool isBranching(Operation *op, unsigned minFanout = 2) {
+    return countDistinctUsers(op) >= minFanout;
+  }
+  static Operation *nearestUpstreamBranching(
+      Operation *start, unsigned minFanout = 2) {
+    llvm::SmallPtrSet<Operation *, 32> vis;
+    llvm::SmallVector<Operation *, 32> wl{start};
+    while (!wl.empty()) {
+      Operation *op = wl.pop_back_val();
+      if (!vis.insert(op).second)
+        continue;
+      if (isBranching(op, minFanout))
+        return op;
+      for (Value in : op->getOperands())
+        if (Operation *def = in.getDefiningOp())
+          wl.push_back(def);
+    }
+    return nullptr;
+  }
+  static inline bool entryDominatesAll(Operation *entry, DominanceInfo &dom,
+      const llvm::SmallPtrSetImpl<Operation *> &ops) {
+    for (Operation *o : ops)
+      if (!dom.dominates(entry, o))
+        return false;
+    return true;
+  }
+  static inline bool exitPostDominatesAll(Operation *exit,
+      PostDominanceInfo &pdom, const llvm::SmallPtrSetImpl<Operation *> &ops) {
+    for (Operation *o : ops)
+      if (!pdom.postDominates(exit, o))
+        return false;
+    return true;
+  }
+  static Operation *promoteEntryIfNeeded(
+      Operation *curEntry, Operation *witnessOp, DominanceInfo &dom) {
+    if (dom.dominates(curEntry, witnessOp))
+      return curEntry;
+    return nearestUpstreamBranching(witnessOp); // nullptr이면 실패 신호
+  }
+  static Operation *demoteExitIfNeeded(
+      Operation *curExit, Operation *witnessUser, PostDominanceInfo &pdom) {
+    if (pdom.postDominates(curExit, witnessUser))
+      return curExit;
+    return witnessUser; // 간단 전략: 필요 시 더 뒤의 user로 내림
+  }
+  static void pruneToEssentialPath(Operation *entry, Operation *exit,
+      llvm::SmallPtrSetImpl<Operation *> &scope) {
+    llvm::SmallPtrSet<Operation *, 32> reachFromEntry, canReachExit, keep;
+    // forward(users) from entry
+    {
+      llvm::SmallVector<Operation *, 128> wl{entry};
+      while (!wl.empty()) {
+        Operation *op = wl.pop_back_val();
+        if (!scope.contains(op))
+          continue;
+        if (!reachFromEntry.insert(op).second)
+          continue;
+        for (Value r : op->getResults())
+          for (Operation *u : r.getUsers())
+            wl.push_back(u);
+      }
+    }
+    // backward(defs) to exit
+    {
+      llvm::SmallVector<Operation *, 128> wl{exit};
+      while (!wl.empty()) {
+        Operation *op = wl.pop_back_val();
+        if (!scope.contains(op))
+          continue;
+        if (!canReachExit.insert(op).second)
+          continue;
+        for (Value in : op->getOperands())
+          if (Operation *def = in.getDefiningOp())
+            wl.push_back(def);
+      }
+    }
+    for (Operation *op : scope)
+      if (reachFromEntry.contains(op) && canReachExit.contains(op))
+        keep.insert(op);
+    scope.clear();
+    for (Operation *op : keep)
+      scope.insert(op);
+  }
+
+  // -------------------- main (bool) --------------------
+  static bool findIsolatedSubgraph(Operation *seedOp,
+      Operation *analysisRootOp, // 보통 func::FuncOp
+      IsolatedSubgraph &out) {
+    DominanceInfo dom(analysisRootOp);
+    PostDominanceInfo pdom(analysisRootOp);
+
+    // 1) 초기 S/E: S = seed에서 가장 가까운 분기(upstream), E = seed
+    Operation *entryGate = nearestUpstreamBranching(seedOp, /*fanout=*/2);
+    if (!entryGate)
+      return false; // S must be branching
+    Operation *exitGate = seedOp;
+
+    // 2) seed 시작 lazy 확장 (게이트 위반 시 S/E를 ‘필요한 만큼’만 조정)
+    llvm::SmallPtrSet<Operation *, 32> subgraphOps;
+    llvm::SmallVector<Operation *, 32> worklist{seedOp};
+
+    for (int iter = 0; iter < 256 && !worklist.empty(); ++iter) {
+      Operation *op = worklist.pop_back_val();
+      if (subgraphOps.contains(op))
+        continue;
+
+      // 게이트 조건 미충족 시 S/E 조정
+      if (!dom.dominates(entryGate, op)) {
+        if (Operation *ne = promoteEntryIfNeeded(entryGate, op, dom))
+          entryGate = ne;
+        else
+          return false;
+        if (!dom.dominates(entryGate, op))
+          continue;
+      }
+      if (!pdom.postDominates(exitGate, op)) {
+        if (Operation *nx = demoteExitIfNeeded(exitGate, op, pdom))
+          exitGate = nx;
+        else
+          return false;
+        if (!pdom.postDominates(exitGate, op))
+          continue;
+      }
+
+      subgraphOps.insert(op);
+
+      // 입력 제약: entry 제외 내부 op는 외부 producer 불가
+      if (op != entryGate) {
+        for (Value in : op->getOperands()) {
+          if (Operation *def = in.getDefiningOp()) {
+            if (!subgraphOps.contains(def)) {
+              if (!dom.dominates(entryGate, def)) {
+                if (Operation *ne = promoteEntryIfNeeded(entryGate, def, dom))
+                  entryGate = ne;
+                else
+                  return false;
+              }
+              worklist.push_back(def);
+            }
+          } else {
+            // BlockArgument → 외부 입력. 정책에 따라 강제 실패
+            return false;
+          }
+        }
+      }
+
+      // 출력 제약: exit 제외 내부 op의 결과는 외부 user 불가
+      if (op != exitGate) {
+        for (Value r : op->getResults()) {
+          for (Operation *u : r.getUsers()) {
+            if (!subgraphOps.contains(u)) {
+              if (!pdom.postDominates(exitGate, u)) {
+                if (Operation *nx = demoteExitIfNeeded(exitGate, u, pdom))
+                  exitGate = nx;
+                else
+                  return false;
+              }
+              worklist.push_back(u);
+            }
+          }
+        }
+      }
+    }
+
+    if (subgraphOps.empty() || !isBranching(entryGate, 2))
+      return false;
+
+    // 3) 더 좁게: U 내부에서 entry 뒤로, exit 앞으로 밀어 넣기
+    {
+      bool changed = true;
+      for (int k = 0; k < 32 && changed; ++k) {
+        changed = false;
+        // entry tighten
+        for (Operation *cand : subgraphOps) {
+          if (cand == entryGate || !isBranching(cand))
+            continue;
+          if (entryDominatesAll(cand, dom, subgraphOps) &&
+              dom.dominates(entryGate, cand)) {
+            entryGate = cand;
+            changed = true;
+          }
+        }
+        // exit tighten
+        for (Operation *cand : subgraphOps) {
+          if (cand == exitGate)
+            continue;
+          if (exitPostDominatesAll(cand, pdom, subgraphOps) &&
+              pdom.postDominates(cand, exitGate)) {
+            exitGate = cand;
+            changed = true;
+          }
+        }
+      }
+    }
+
+    // 4) 경로 프루닝: Entry→…→Exit 경로에 실제로 기여하는 op만
+    pruneToEssentialPath(entryGate, exitGate, subgraphOps);
+
+    // 5) 최종 검증: 단일 entry/exit 격리
+    for (Operation *op : subgraphOps)
+      if (op != entryGate) {
+        for (Value in : op->getOperands()) {
+          if (Operation *def = in.getDefiningOp()) {
+            if (!subgraphOps.contains(def))
+              return false;
+          } else
+            return false;
+        }
+      }
+    for (Operation *op : subgraphOps)
+      if (op != exitGate) {
+        for (Value r : op->getResults())
+          for (Operation *u : r.getUsers())
+            if (!subgraphOps.contains(u))
+              return false;
+      }
+
+    // 6) 출력
+    out.entryGate = entryGate;
+    out.exitGate = exitGate;
+    out.nodes.clear();
+    out.nodes.insert(out.nodes.end(), subgraphOps.begin(), subgraphOps.end());
+    return true;
+  }
+
+  bool matchForkJoinPattern(Operation *peakOp, Operation *&s, Operation *&e,
+      uint32_t detectionScope) {
+
     return false;
   }
 
-  bool matchMergeShrinkPattern(Operation *op, uint32_t detectionScope) {
+  bool matchMergeShrinkPattern(
+      Operation *peakOp, Operation *&s, Operation *&e) {
+    if (isa<ONNXConcatOp>(peakOp)) {
+      s = peakOp;
+    } else {
+      return false;
+    }
+
     return false;
+    // TODO: find E
   }
 
   // ----[ DEBUG (outs) helpers ]----
