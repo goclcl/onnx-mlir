@@ -38,8 +38,8 @@ struct PeakMemOptPass
   void runOnOperation() override {
     func::FuncOp funcOp = getOperation();
     Liveness &liveness = getAnalysis<Liveness>();
-    // auto &dominence = getAnalysis<mlir::DominanceInfo>();
-    // auto &postDominance = getAnalysis<mlir::PostDominanceInfo>();
+    // auto &domInfo = getAnalysis<DominanceInfo>();
+    // auto &postDomInfo = getAnalysis<PostDominanceInfo>();
 
     /* ===============Peak 탐색=============== */
     Operation *peakOp = nullptr;
@@ -93,7 +93,7 @@ struct PeakMemOptPass
     /* ---------------Fork/Join--------------- */
     IsolatedSubgraph isolatedSubgraph;
 
-    if (findIsolatedSubgraph(peakOp, funcOp, isolatedSubgraph)) {
+    if (matchForkJoinPattern(peakOp, funcOp, isolatedSubgraph)) {
       llvm::outs() << "[match Fork/Merge] SPLITTABLE window: S=";
       printOpOneLine(isolatedSubgraph.entryGate);
       llvm::outs() << "  E=";
@@ -103,6 +103,18 @@ struct PeakMemOptPass
       llvm::outs() << "[match Fork/Merge] no window\n";
     }
     /* ---------------Fork/Join--------------- */
+
+    /* ---------------Merge/Shrink--------------- */
+    if (matchMergeShrinkPattern(peakOp, s, e)) {
+      llvm::outs() << "[match Merge/Shrink] SPLITTABLE window: S=";
+      printOpOneLine(s);
+      llvm::outs() << "  E=";
+      printOpOneLine(e);
+      llvm::outs() << "\n";
+    } else {
+      llvm::outs() << "[match Merge/Shrink] no window\n";
+    }
+    /* ---------------Merge/Shrink--------------- */
   }
 
 private:
@@ -115,7 +127,7 @@ private:
 
   enum class IsolateStatus {
     None,
-    Splittable,
+    Isolated,
     ExternalInput,
     ExternalOutput,
     NotSplittable
@@ -214,8 +226,7 @@ private:
       res = TensorSizeChange::SAME;
     }
 
-    // [outs] 간단 요약
-    llvm::outs() << "[size] ";
+    llvm::outs() << "[checkTensorSizeChange] ";
     printOpOneLine(op);
     llvm::outs() << " in=" << totalInputSize << "B"
                  << " out=" << totalOutputSize << "B"
@@ -298,12 +309,11 @@ private:
   }
 
   // --- 메인 함수: 서브그래프 고립성 검사 ---
-  static IsolateStatus isIsolatedSubGraph(
-      mlir::Operation *S, mlir::Operation *E) {
+  static IsolateStatus isIsolatedSubGraph(Operation *S, Operation *E) {
 
     // S나 E를 못찾았으면 notSplittable
     if (!S || !E) {
-      llvm::outs() << "[isIsolatedSubGraph] NotSplittable: S or E is null\n";
+      llvm::outs() << "[isIsolatedSubGraph] NotSplittable: S or E is nullptr\n";
       return IsolateStatus::NotSplittable;
     }
 
@@ -384,7 +394,7 @@ private:
     }
 
     // 모든 검사를 통과
-    return IsolateStatus::Splittable;
+    return IsolateStatus::Isolated;
   }
 
   bool matchExpandShrinkPattern(Operation *peakOp, Operation *&s, Operation *&e,
@@ -488,7 +498,7 @@ private:
       }
     };
 
-    while (status != IsolateStatus::Splittable) {
+    while (status != IsolateStatus::Isolated) {
       if (detectionScope == 0) {
         llvm::outs() << "[match] scope exhausted\n";
         return false;
@@ -530,6 +540,8 @@ private:
     // S~E까지 몇 개의 op를 split해야하며
     // 최적화로 얻는 이득은 얼마인지?(peak memory reduction)
   }
+
+  /*======================================================*/
 
   struct IsolatedSubgraph {
     Operation *entryGate = nullptr; // S (must be branching; fanout>=2)
@@ -630,21 +642,21 @@ private:
   }
 
   // -------------------- main (bool) --------------------
-  static bool findIsolatedSubgraph(Operation *seedOp,
+  static bool matchForkJoinPattern(Operation *peakOp,
       Operation *analysisRootOp, // 보통 func::FuncOp
       IsolatedSubgraph &out) {
     DominanceInfo dom(analysisRootOp);
     PostDominanceInfo pdom(analysisRootOp);
 
     // 1) 초기 S/E: S = seed에서 가장 가까운 분기(upstream), E = seed
-    Operation *entryGate = nearestUpstreamBranching(seedOp, /*fanout=*/2);
+    Operation *entryGate = nearestUpstreamBranching(peakOp, /*fanout=*/2);
     if (!entryGate)
       return false; // S must be branching
-    Operation *exitGate = seedOp;
+    Operation *exitGate = peakOp;
 
     // 2) seed 시작 lazy 확장 (게이트 위반 시 S/E를 ‘필요한 만큼’만 조정)
     llvm::SmallPtrSet<Operation *, 32> subgraphOps;
-    llvm::SmallVector<Operation *, 32> worklist{seedOp};
+    llvm::SmallVector<Operation *, 32> worklist{peakOp};
 
     for (int iter = 0; iter < 256 && !worklist.empty(); ++iter) {
       Operation *op = worklist.pop_back_val();
@@ -770,22 +782,117 @@ private:
     return true;
   }
 
-  bool matchForkJoinPattern(Operation *peakOp, Operation *&s, Operation *&e,
-      uint32_t detectionScope) {
-
-    return false;
-  }
-
   bool matchMergeShrinkPattern(
-      Operation *peakOp, Operation *&s, Operation *&e) {
-    if (isa<ONNXConcatOp>(peakOp)) {
-      s = peakOp;
-    } else {
+      Operation *peakOp, Operation *&sOut, Operation *&eOut) {
+
+    std::queue<Operation *> findConcatWorklist;
+    llvm::DenseSet<Operation *> findConcatVisited;
+    Operation *concatOp = nullptr;
+
+    std::queue<Operation *> findShrinkerWorklist;
+    llvm::DenseSet<Operation *> findShrinkerVisited;
+    Operation *shrinker = nullptr;
+
+    findConcatWorklist.push(peakOp);
+    findShrinkerWorklist.push(peakOp);
+
+    auto findConcatOpBackward = [&]() -> Operation * {
+      while (!findConcatWorklist.empty()) {
+        Operation *currentOp = findConcatWorklist.front();
+        findConcatWorklist.pop();
+        findConcatVisited.insert(currentOp);
+
+        for (Value v : currentOp->getOperands()) {
+          Operation *defOp = v.getDefiningOp();
+          // defOp가 null이거나 Constant거나 noValue면 스킵
+          // 이미 방문한 노드도 스킵
+          if (findConcatVisited.contains(defOp) || !defOp ||
+              isa<ONNXConstantOp>(defOp) || isa<ONNXNoneOp>(defOp))
+            continue;
+          findConcatWorklist.push(defOp);
+        }
+
+        if (isa<ONNXConcatOp>(currentOp)) {
+          return currentOp;
+        }
+      }
+
+      return nullptr;
+    };
+
+    auto findShrinkerForward = [&]() -> Operation * {
+      while (!findShrinkerWorklist.empty()) {
+        Operation *currentOp = findShrinkerWorklist.front();
+        findShrinkerWorklist.pop();
+        findShrinkerVisited.insert(currentOp);
+
+        for (Value v : currentOp->getResults()) {
+          for (Operation *userOp : v.getUsers()) {
+            // 이미 방문한 노드는 스킵
+            if (findShrinkerVisited.contains(userOp))
+              continue;
+            findShrinkerWorklist.push(userOp);
+          }
+        }
+
+        if (checkTensorSizeChange(currentOp) == TensorSizeChange::SHRINK) {
+          return currentOp;
+        }
+      }
+      // 못찾음
+      return nullptr;
+    };
+
+    if (!(concatOp = findConcatOpBackward())) {
+      llvm::outs() << "[match Merge/Shrink] Cannot find Concat Op \n";
       return false;
+    } else {
+      llvm::outs() << "[match Merge/Shrink] found Concat Op: ";
+      printOpOneLine(concatOp);
+      llvm::outs() << '\n';
     }
 
-    return false;
-    // TODO: find E
+    if (!(shrinker = findShrinkerForward())) {
+      llvm::outs() << "[match Merge/Shrink] Cannot find Shrinker \n";
+      return false;
+    } else {
+      llvm::outs() << "[match Merge/Shrink] found Shrinker: ";
+      printOpOneLine(shrinker);
+      llvm::outs() << '\n';
+    }
+
+    IsolateStatus status = isIsolatedSubGraph(concatOp, shrinker);
+
+    while (status != IsolateStatus::Isolated) {
+      if (status == IsolateStatus::ExternalInput) {
+        if (!(concatOp = findConcatOpBackward())) {
+          llvm::outs() << "[match Merge/Shrink] Cannot find Concat Op \n";
+          return false;
+        } else {
+          llvm::outs() << "[match Merge/Shrink] found Concat Op: ";
+          printOpOneLine(concatOp);
+          llvm::outs() << '\n';
+          status = isIsolatedSubGraph(concatOp, shrinker);
+        }
+      } else if (status == IsolateStatus::ExternalOutput) {
+        if (!(shrinker = findShrinkerForward())) {
+          llvm::outs() << "[match Merge/Shrink] Cannot find Shrinker \n";
+          return false;
+        } else {
+          llvm::outs() << "[match Merge/Shrink] found Shrinker: ";
+          printOpOneLine(shrinker);
+          llvm::outs() << '\n';
+          status = isIsolatedSubGraph(concatOp, shrinker);
+        }
+      } else if (status == IsolateStatus::NotSplittable) {
+        llvm::outs() << "[match Merge/Shrink] status == NotSplittable \n";
+        return false;
+      }
+    }
+
+    sOut = concatOp;
+    eOut = shrinker;
+    return true;
   }
 
   // ----[ DEBUG (outs) helpers ]----
@@ -815,7 +922,7 @@ private:
     switch (v) {
     case IsolateStatus::None:
       return "None";
-    case IsolateStatus::Splittable:
+    case IsolateStatus::Isolated:
       return "Splittable";
     case IsolateStatus::ExternalInput:
       return "ExternalInput";
