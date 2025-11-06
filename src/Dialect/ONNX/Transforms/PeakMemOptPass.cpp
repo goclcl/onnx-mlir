@@ -70,22 +70,21 @@ struct PeakMemOptPass
     /* ===============Optimizable Patterns 탐색=============== */
 
     /* ---------------Expand/Shrink--------------- */
-    Operation *s = nullptr;
-    Operation *e = nullptr;
     const uint32_t DETECTION_SCOPE = 64;
 
     llvm::outs() << "[match] try EXPAND~SHRINK from peak, scope="
                  << DETECTION_SCOPE << "\n";
 
-    bool matched = matchExpandShrinkPattern(peakOp, s, e, DETECTION_SCOPE);
+    subgraph expandShrinkSubgraph =
+        matchExpandShrinkPattern(peakOp, DETECTION_SCOPE);
 
-    if (!matched) {
+    if (!expandShrinkSubgraph.s) {
       llvm::outs() << "[match Expand/Shrink] no window\n";
     } else {
       llvm::outs() << "[match Expand/Shrink] SPLITTABLE window: S=";
-      printOpOneLine(s);
+      printOpOneLine(expandShrinkSubgraph.s);
       llvm::outs() << "  E=";
-      printOpOneLine(e);
+      printOpOneLine(expandShrinkSubgraph.e);
       llvm::outs() << "\n";
     }
     /* ---------------Expand/Shrink--------------- */
@@ -105,16 +104,29 @@ struct PeakMemOptPass
     /* ---------------Fork/Join--------------- */
 
     /* ---------------Merge/Shrink--------------- */
-    if (matchMergeShrinkPattern(peakOp, s, e)) {
+    subgraph mergeShrinkSubgraph = matchMergeShrinkPattern(peakOp);
+    if (mergeShrinkSubgraph.s) {
       llvm::outs() << "[match Merge/Shrink] SPLITTABLE window: S=";
-      printOpOneLine(s);
+      printOpOneLine(mergeShrinkSubgraph.s);
       llvm::outs() << "  E=";
-      printOpOneLine(e);
+      printOpOneLine(mergeShrinkSubgraph.e);
       llvm::outs() << "\n";
     } else {
       llvm::outs() << "[match Merge/Shrink] no window\n";
     }
     /* ---------------Merge/Shrink--------------- */
+
+    /* ===============Split=============== */
+    if (expandShrinkSubgraph.s) {
+      llvm::DenseSet<int64_t> splittableDims =
+          getSplittableDims(expandShrinkSubgraph);
+
+      llvm::outs() << "[Splittable Dims] ";
+      for (int64_t dim : splittableDims) {
+        llvm::outs() << dim << ' ';
+      }
+      llvm::outs() << '\n';
+    }
   }
 
 private:
@@ -131,6 +143,14 @@ private:
     ExternalInput,
     ExternalOutput,
     NotSplittable
+  };
+
+  struct subgraph {
+    Operation *s = nullptr; // start node
+    Operation *e = nullptr; // End node
+    llvm::DenseSet<Operation *>
+        subgraphNodes;           // All ops in s→e path including s and e
+    int64_t splitDimension = -1; // Dimension to split along
   };
 
   // TensorType 크기 계산: byte단위의 사이즈 반환
@@ -256,8 +276,8 @@ private:
         continue;
       }
 
-      for (mlir::Value result : currentOp->getResults()) {
-        for (mlir::Operation *userOp : result.getUsers()) {
+      for (Value result : currentOp->getResults()) {
+        for (Operation *userOp : result.getUsers()) {
           // 이미 방문한 노드는 스킵
           if (visitedSet.contains(userOp)) {
             continue;
@@ -308,45 +328,45 @@ private:
     return visitedSet;
   }
 
-  // --- 메인 함수: 서브그래프 고립성 검사 ---
-  static IsolateStatus isIsolatedSubGraph(Operation *S, Operation *E) {
-
-    // S나 E를 못찾았으면 notSplittable
-    if (!S || !E) {
-      llvm::outs() << "[isIsolatedSubGraph] NotSplittable: S or E is nullptr\n";
-      return IsolateStatus::NotSplittable;
+  // s에서 시작해 e로 끝나는 서브 그래프 노드 집합 반환
+  static llvm::DenseSet<Operation *> getSubgraphNodes(
+      Operation *s, Operation *e) {
+    if (!s) {
+      llvm::outs() << "[getSubgraphNodes] s = nullptr \n";
+      return {};
+    }
+    if (!e) {
+      llvm::outs() << "[getSubgraphNodes] e = nullptr \n";
+      return {};
     }
 
-    // 1단계: 서브그래프 노드 집합 정의
     llvm::DenseSet<mlir::Operation *> forwardSet =
-        getForwardReachableNodes(S, E);
+        getForwardReachableNodes(s, e);
 
     llvm::DenseSet<mlir::Operation *> backwardSet =
-        getBackwardReachableNodes(S, E);
+        getBackwardReachableNodes(s, e);
 
-    llvm::DenseSet<mlir::Operation *> subGraphNodes;
+    llvm::DenseSet<mlir::Operation *> subgraphNodes;
     for (mlir::Operation *op : forwardSet) {
       if (backwardSet.contains(op)) {
-        subGraphNodes.insert(op);
+        subgraphNodes.insert(op);
       }
     }
 
-    // (방어 코드) S와 E가 교집합에 모두 포함되어 있어야 함
-    if (!subGraphNodes.contains(S) || !subGraphNodes.contains(E)) {
-      llvm::outs()
-          << "[isIsolatedSubGraph] Failed: Path intersection is incomplete. "
-          << "S (" << S->getName() << ") or E (" << E->getName()
-          << ") is not included in the final subgraph.\n";
-      return IsolateStatus::NotSplittable;
-    }
+    return subgraphNodes;
+  }
 
-    // 2단계: I/O 검사
-    for (mlir::Operation *op : subGraphNodes) {
+  // 서브그래프 고립성 검사
+  static IsolateStatus isIsolatedSubgraph(Operation *s, Operation *e) {
+    llvm::DenseSet<Operation *> subgraphNodes = getSubgraphNodes(s, e);
 
-      // --- 2.1 External Input 검사 ---
-      if (op != S) {
-        for (mlir::Value operand : op->getOperands()) {
-          mlir::Operation *defOp = operand.getDefiningOp();
+    // I/O 검사
+    for (Operation *op : subgraphNodes) {
+
+      // External Input 검사
+      if (op != s) {
+        for (Value operand : op->getOperands()) {
+          Operation *defOp = operand.getDefiningOp();
 
           // constant와 noValue op는 스킵
           if (isa<ONNXConstantOp>(defOp) || isa<ONNXNoneOp>(defOp)) {
@@ -356,16 +376,16 @@ private:
           if (!defOp) {
             // Case 1: BlockArgument (S가 아닌데 함수 인자를 받음)
             llvm::outs()
-                << "[isIsolatedSubGraph] Failed: External input. Node ("
+                << "[isIsolatedSubgraph] Failed: External input. Node ("
                 << op->getName() << ") is not S, but it receives "
                 << "a BlockArgument (" << operand << ") as input.\n";
             return IsolateStatus::NotSplittable;
           }
 
-          if (!subGraphNodes.contains(defOp)) {
+          if (!subgraphNodes.contains(defOp)) {
             // Case 2: Op Result (S 또는 서브그래프 내부 노드가 아닌 곳에서
             // 입력을 받음)
-            llvm::outs() << "[isIsolatedSubGraph] ExternalInput at ";
+            llvm::outs() << "[isIsolatedSubgraph] ExternalInput at ";
             printOpOneLine(op);
             llvm::outs() << " <- ";
             printOpOneLine(defOp);
@@ -376,12 +396,12 @@ private:
       }
 
       // --- 2.2 External Output 검사 ---
-      if (op != E) {
+      if (op != e) {
         for (mlir::Value result : op->getResults()) {
           for (mlir::Operation *userOp : result.getUsers()) {
             // 서브그래프 외부(E가 아닌) 노드가 이 값을 사용함
-            if (!subGraphNodes.contains(userOp)) {
-              llvm::outs() << "[isIsolatedSubGraph] ExternalOutput at ";
+            if (!subgraphNodes.contains(userOp)) {
+              llvm::outs() << "[isIsolatedSubgraph] ExternalOutput at ";
               printOpOneLine(op);
               llvm::outs() << " -> ";
               printOpOneLine(userOp);
@@ -397,8 +417,8 @@ private:
     return IsolateStatus::Isolated;
   }
 
-  bool matchExpandShrinkPattern(Operation *peakOp, Operation *&s, Operation *&e,
-      uint32_t detectionScope) {
+  subgraph matchExpandShrinkPattern(
+      Operation *peakOp, uint32_t detectionScope) {
     Operation *expander = nullptr;
     Operation *shrinker = nullptr;
     SmallPtrSet<Operation *, 32> visited;
@@ -501,41 +521,39 @@ private:
     while (status != IsolateStatus::Isolated) {
       if (detectionScope == 0) {
         llvm::outs() << "[match] scope exhausted\n";
-        return false;
+        return subgraph{};
       }
 
       if (status == IsolateStatus::None) {
         backwardSearch();
         forwardSearch();
-        status = isIsolatedSubGraph(expander, shrinker);
+        status = isIsolatedSubgraph(expander, shrinker);
       } else if (status == IsolateStatus::ExternalInput) {
         llvm::outs() << "[match] status=" << toString(status)
                      << " -> expand backward\n";
         backwardSearch();
-        status = isIsolatedSubGraph(expander, shrinker);
+        status = isIsolatedSubgraph(expander, shrinker);
       } else if (status == IsolateStatus::ExternalOutput) {
         llvm::outs() << "[match] status=" << toString(status)
                      << " -> expand forward\n";
         forwardSearch();
-        status = isIsolatedSubGraph(expander, shrinker);
+        status = isIsolatedSubgraph(expander, shrinker);
       } else if (status == IsolateStatus::NotSplittable) {
         llvm::outs() << "[match] NotSplittable\n";
-        return false;
+        return subgraph{};
       }
       llvm::outs() << "[match] status now=" << toString(status) << "\n";
     }
 
-    // 최종 성공: s/e를 실제로 바깥에 반영
-    s = expander;
-    e = shrinker;
-
     llvm::outs() << "[match] SPLITTABLE: S=";
-    printOpOneLine(s);
+    printOpOneLine(expander);
     llvm::outs() << "  E=";
-    printOpOneLine(e);
+    printOpOneLine(shrinker);
     llvm::outs() << "\n";
 
-    return true;
+    return subgraph{.s = expander,
+        .e = shrinker,
+        .subgraphNodes = getSubgraphNodes(expander, shrinker)};
 
     // S~E까지 몇 개의 op를 split해야하며
     // 최적화로 얻는 이득은 얼마인지?(peak memory reduction)
@@ -782,8 +800,7 @@ private:
     return true;
   }
 
-  bool matchMergeShrinkPattern(
-      Operation *peakOp, Operation *&sOut, Operation *&eOut) {
+  subgraph matchMergeShrinkPattern(Operation *peakOp) {
 
     std::queue<Operation *> findConcatWorklist;
     llvm::DenseSet<Operation *> findConcatVisited;
@@ -845,7 +862,7 @@ private:
 
     if (!(concatOp = findConcatOpBackward())) {
       llvm::outs() << "[match Merge/Shrink] Cannot find Concat Op \n";
-      return false;
+      return subgraph{};
     } else {
       llvm::outs() << "[match Merge/Shrink] found Concat Op: ";
       printOpOneLine(concatOp);
@@ -854,45 +871,248 @@ private:
 
     if (!(shrinker = findShrinkerForward())) {
       llvm::outs() << "[match Merge/Shrink] Cannot find Shrinker \n";
-      return false;
+      return subgraph{};
     } else {
       llvm::outs() << "[match Merge/Shrink] found Shrinker: ";
       printOpOneLine(shrinker);
       llvm::outs() << '\n';
     }
 
-    IsolateStatus status = isIsolatedSubGraph(concatOp, shrinker);
+    IsolateStatus status = isIsolatedSubgraph(concatOp, shrinker);
 
     while (status != IsolateStatus::Isolated) {
       if (status == IsolateStatus::ExternalInput) {
         if (!(concatOp = findConcatOpBackward())) {
           llvm::outs() << "[match Merge/Shrink] Cannot find Concat Op \n";
-          return false;
+          return subgraph{};
         } else {
           llvm::outs() << "[match Merge/Shrink] found Concat Op: ";
           printOpOneLine(concatOp);
           llvm::outs() << '\n';
-          status = isIsolatedSubGraph(concatOp, shrinker);
+          status = isIsolatedSubgraph(concatOp, shrinker);
         }
       } else if (status == IsolateStatus::ExternalOutput) {
         if (!(shrinker = findShrinkerForward())) {
           llvm::outs() << "[match Merge/Shrink] Cannot find Shrinker \n";
-          return false;
+          return subgraph{};
         } else {
           llvm::outs() << "[match Merge/Shrink] found Shrinker: ";
           printOpOneLine(shrinker);
           llvm::outs() << '\n';
-          status = isIsolatedSubGraph(concatOp, shrinker);
+          status = isIsolatedSubgraph(concatOp, shrinker);
         }
       } else if (status == IsolateStatus::NotSplittable) {
         llvm::outs() << "[match Merge/Shrink] status == NotSplittable \n";
-        return false;
+        return subgraph{};
       }
     }
 
-    sOut = concatOp;
-    eOut = shrinker;
-    return true;
+    return subgraph{.s = concatOp,
+        .e = shrinker,
+        .subgraphNodes = getSubgraphNodes(concatOp, shrinker)};
+  }
+
+  /*=========opimize logic=========*/
+  static bool isDimPreserved(Operation *op, size_t dimension, Operation *e) {
+    // Conv일 경우
+    if (auto convOp = dyn_cast<ONNXConvOp>(op)) {
+      // channel dimension일 경우
+      if (dimension == 1) {
+        int64_t group = convOp.getGroup();
+        Value input = convOp.getX();
+        auto tensorType = dyn_cast<TensorType>(input.getType());
+        ArrayRef<int64_t> shape = tensorType.getShape();
+        int64_t inChannel = shape[1];
+
+        // convOp가 depthwise convolution이 아니라면
+        if (group != inChannel) {
+          llvm::outs() << "[isDimPreserved] Failed: Check channel dimension "
+                          "dependency but convolution is not Depthwis conv. \n";
+          return false;
+        }
+      }
+
+      if (op == e) {
+        return true;
+      }
+
+      Value outVal = convOp.getResult();
+      for (Operation *userOp : outVal.getUsers()) {
+        return isDimPreserved(userOp, dimension, e);
+      }
+    }
+    // MatMul일 경우
+    else if (auto matmulOp = dyn_cast<ONNXMatMulOp>(op)) {
+      Value a = matmulOp.getA();
+      Value b = matmulOp.getB();
+      Operation *opA = a.getDefiningOp();
+      Operation *opB = b.getDefiningOp();
+
+      if (!isa<ONNXConstantOp>(opA)) {
+        TensorType tensorTypeA = dyn_cast<TensorType>(a.getType());
+        auto shape = tensorTypeA.getShape();
+        // 뒤에서 첫번째 차원
+        if (shape.size() - 1 == dimension) {
+          llvm::outs() << "[isDimPreserved] Failed: target dimension is "
+                          "reduction dimension. \n  Op: ";
+          printOpOneLine(op);
+          llvm::outs() << "\n Dim: " << dimension;
+        }
+        return false;
+      }
+
+      if (!isa<ONNXConstantOp>(opB)) {
+        TensorType tensorTypeA = dyn_cast<TensorType>(a.getType());
+        auto shape = tensorTypeA.getShape();
+        // 뒤에서 두번째 차원
+        if (shape.size() - 2 == dimension) {
+          llvm::outs() << "[isDimPreserved] Failed: target dimension is "
+                          "reduction dimension. Op: ";
+          printOpOneLine(op);
+          llvm::outs() << "\n";
+        }
+        return false;
+      }
+
+      if (op == e) {
+        return true;
+      }
+
+      Value outVal = matmulOp.getResult();
+      for (Operation *userOp : outVal.getUsers()) {
+        return isDimPreserved(userOp, dimension, e);
+      }
+    }
+    // Reshape일 경우
+    else if (auto reshapeOp = dyn_cast<ONNXReshapeOp>(op)) {
+      Value inVal = reshapeOp.getData();
+      TensorType inputTensorType = dyn_cast<TensorType>(inVal.getType());
+      auto inputShape = inputTensorType.getShape();
+
+      Value outVal = reshapeOp.getReshaped();
+      TensorType outputTensorType = dyn_cast<TensorType>(outVal.getType());
+      auto outputShape = outputTensorType.getShape();
+
+      int64_t targetDimSize = inputShape[dimension];
+
+      int64_t inputProd = 1;
+      for (size_t i = 0; i < dimension; i++) {
+        inputProd = inputProd * inputShape[i];
+      }
+
+      // target dimension이 보존되는지 검증
+      int64_t outputProd = 1;
+      for (size_t i = 0; i < outputShape.size(); i++) {
+        if (outputShape[i] == targetDimSize) {
+          for (size_t j = 0; j < i; j++) {
+            outputProd = outputProd * outputShape[j];
+          }
+          if (inputProd == outputProd) {
+            Value outVal = reshapeOp.getResult();
+            for (Operation *userOp : outVal.getUsers()) {
+              return isDimPreserved(userOp, i, e); // i == 바뀐 target dimension
+            }
+          }
+        }
+      }
+      llvm::outs() << "[isDimPreserved] Fail: ReshapeOp fuses or splits target "
+                      "dimension. \n    Op: ";
+      printOpOneLine(reshapeOp);
+      llvm::outs() << "\n    Dimension: " << dimension << "\n";
+      return false;
+    }
+    // elementwise 연산일 경우
+    else if (isa<ONNXAddOp, ONNXClipOp>(op)) {
+      if (op == e) {
+        return true;
+      }
+      if (op->getNumResults() != 1) {
+        llvm::outs() << "[isDimPreserved] Failed: Multiple results at Op: ";
+        printOpOneLine(op);
+        llvm::outs() << "\n";
+        return false;
+      }
+      Value outVal = op->getResult(0);
+      for (Operation *userOp : outVal.getUsers()) {
+        return isDimPreserved(userOp, dimension, e);
+      }
+    }
+    llvm::outs() << "[isDimPreserved] Failed: Unknown Op: ";
+    printOpOneLine(op);
+    llvm::outs() << "\n";
+    return false;
+  }
+
+  llvm::DenseSet<int64_t> getSplittableDims(subgraph &subgraph) {
+    llvm::DenseSet<int64_t> splittableDims;
+
+    if (subgraph.s->getNumResults() != 1) {
+      llvm::outs() << "[getSplittableDims] Fail: s has multiple results. \n";
+    }
+
+    Value sOut = subgraph.s->getResult(0);
+    TensorType tensorType = dyn_cast<RankedTensorType>(sOut.getType());
+    int64_t rank = tensorType.getRank();
+    llvm::outs() << "[getSplittableDims] Rank: " << rank << "\n";
+
+    auto userOps = sOut.getUsers();
+
+    for (int i = 1; i < rank; i++) {
+      bool preserved = false;
+
+      for (Operation *op : userOps) {
+        preserved = isDimPreserved(op, i, subgraph.e);
+        if (!preserved) {
+          break;
+        }
+      }
+      if (preserved) {
+        splittableDims.insert(i);
+      }
+    }
+
+    return splittableDims;
+  }
+
+  int64_t determineSplitAxis(subgraph &subgraph) {
+    if (subgraph.s->getNumResults() != 1) {
+      llvm::outs() << "[determineSplitAxis] Fail: s has multiple results. \n";
+    }
+
+    Value sOutput = subgraph.s->getResult(0);
+    auto tensorType = dyn_cast<TensorType>(sOutput.getType());
+    ArrayRef<int64_t> shape = tensorType.getShape();
+
+    // 1: Channel dimension (typically dim 1 for NCHW)
+    int64_t dimension1 = shape[1];
+    // s가 무슨 연산인지에 따라
+    if (auto matmulOp = dyn_cast<ONNXMatMulOp>(subgraph.s)) {
+      // TODO: MatMul 처리 로직
+
+    } else if (auto convOp = dyn_cast<ONNXConvOp>(subgraph.s)) {
+      // TODO: Conv 처리 로직
+
+      // isa는 여러 타입을 동시에 확인 가능
+    } else if (isa<ONNXAddOp, ONNXClipOp>(subgraph.s)) {
+      // TODO: Add 또는 Clip 처리 로직
+
+    } else {
+      // 그 외 다른 Op들
+    }
+
+    // Priority 2: Spatial dimensions (last dim for flattened tensors)
+    for (int64_t i = shape.size() - 1; i >= 0; i--) {
+      if (shape[i] > 1 && shape[i] % 2 == 0) {
+        return i;
+      }
+    }
+
+    // Priority 3: Batch dimension (fallback)
+    return 0;
+  }
+
+  void optimizeExpandShrinkPattern(subgraph expandShrinkSubgraph) {
+    // TODO:
   }
 
   // ----[ DEBUG (outs) helpers ]----
