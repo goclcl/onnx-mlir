@@ -1,8 +1,6 @@
 #include <algorithm>
 #include <deque>
 #include <queue>
-#include <system_error>
-#include <vector>
 
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallPtrSet.h"
@@ -10,6 +8,7 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include "mlir/Analysis/Liveness.h"
+#include "mlir/Analysis/TopologicalSortUtils.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Attributes.h"
 #include "mlir/IR/Builders.h"
@@ -38,6 +37,7 @@ struct PeakMemOptPass
   void runOnOperation() override {
     func::FuncOp funcOp = getOperation();
     Liveness &liveness = getAnalysis<Liveness>();
+
     // auto &domInfo = getAnalysis<DominanceInfo>();
     // auto &postDomInfo = getAnalysis<PostDominanceInfo>();
 
@@ -116,7 +116,7 @@ struct PeakMemOptPass
     }
     /* ---------------Merge/Shrink--------------- */
 
-    /* ===============Split=============== */
+    /* ===============Check Splittability=============== */
     if (expandShrinkSubgraph.s) {
       llvm::DenseSet<int64_t> splittableDims =
           getSplittableDims(expandShrinkSubgraph);
@@ -127,6 +127,17 @@ struct PeakMemOptPass
       }
       llvm::outs() << '\n';
     }
+    // if (forkJoinSubgraph.s) {
+    //   // TODO:
+    // }
+    // if (mergeShrinkSubgraph.s) {
+    //   // TODO:
+    // }
+    /* ===============Check Splittability=============== */
+
+    /* ===============Split=============== */
+
+    /* ===============Split=============== */
   }
 
 private:
@@ -1111,8 +1122,138 @@ private:
     return 0;
   }
 
-  void optimizeExpandShrinkPattern(subgraph expandShrinkSubgraph) {
+  static std::pair<Value, Value> splitValue(
+      OpBuilder &builder, Location loc, Value input, int64_t axis = 0) {
+    if (!input || isa<NoneType>(input.getType())) {
+      Value none = builder.create<ONNXNoneOp>(loc).getResult();
+      return {none, none};
+    }
+    auto inputType = dyn_cast<RankedTensorType>(input.getType());
+    if (!inputType || inputType.getRank() <= axis) {
+      llvm::outs()
+          << "[splitValue] fail: Input value is unranked or (rank < axis). \n";
+      return {nullptr, nullptr};
+    }
+    auto shape = inputType.getShape();
+    auto elementTy = inputType.getElementType();
+
+    int64_t num_outputs = 2;
+    int64_t totalSize = shape[axis];
+    int64_t secondSize = totalSize / num_outputs;
+    int64_t firstSize = totalSize - secondSize;
+
+    SmallVector<int64_t, 4> shapeA(shape.begin(), shape.end());
+    shapeA[axis] = firstSize;
+    SmallVector<int64_t, 4> shapeB(shape.begin(), shape.end());
+    shapeB[axis] = secondSize;
+
+    Type typeA = RankedTensorType::get(shapeA, elementTy);
+    Type typeB = RankedTensorType::get(shapeB, elementTy);
+
+    auto noneVal = builder.create<ONNXNoneOp>(loc).getResult();
+    auto splitOp = builder.create<ONNXSplitOp>(loc, TypeRange{typeA, typeB},
+        input, noneVal,
+        builder.getIntegerAttr(builder.getIntegerType(64, true), axis),
+        builder.getIntegerAttr(builder.getIntegerType(64, true), num_outputs));
+    return {splitOp.getResult(0), splitOp.getResult(1)};
+  }
+
+  void splitSubgraph(subgraph subgraph, int64_t splitDim) {
     // TODO:
+    llvm::outs() << "[splitSubgraph] Splitting subgraph at dimension "
+                 << splitDim << "\n";
+
+    Operation *s = subgraph.s;
+    Operation *e = subgraph.e;
+    OpBuilder builder(s->getContext());
+
+    /*------------split S node------------*/
+    if (auto convOp = dyn_cast<ONNXConvOp>(s)) {
+      Location loc = convOp.getLoc();
+      // get operands and attrs
+      Value x = convOp.getX();
+      Value w = convOp.getW();
+      Value b = convOp.getB();
+      StringAttr autoPad = convOp.getAutoPadAttr();
+      ArrayAttr dilations = convOp.getDilationsAttr();
+      IntegerAttr group = convOp.getGroupAttr();
+      ArrayAttr kernelShape = convOp.getKernelShapeAttr();
+      ArrayAttr pads = convOp.getPadsAttr();
+      ArrayAttr strides = convOp.getStridesAttr();
+
+      auto makeConv = [&](Value x, Value w, Value b,
+                          IntegerAttr group) -> Value {
+        ONNXConvOp conv = builder.create<ONNXConvOp>(loc, x, w, b, autoPad,
+            dilations, group, kernelShape, pads, strides);
+        return conv.getResult();
+      };
+
+      // channel
+      if (splitDim == 1) {
+        // Split weight and bias
+        auto [w1, w2] = splitValue(builder, loc, w, 0);
+        auto [b1, b2] = splitValue(builder, loc, b, 0);
+
+        // Set group attrs
+        int64_t g = group.getInt();
+        int64_t g2 = g / 2;
+        int64_t g1 = g - g2;
+
+        IntegerAttr group1 = builder.getI64IntegerAttr(g1);
+        IntegerAttr group2 = builder.getI64IntegerAttr(g2);
+
+        // Make Op
+        builder.setInsertionPoint(s);
+        Value Y1 = makeConv(x, w1, b1, group1);
+        Value Y2 = makeConv(x, w2, b2, group2);
+      }
+      // height, width
+      else if (splitDim == 2 || splitDim == 3) {
+        // TODO:
+      } else {
+        llvm::outs() << "[splitSubgraph] fail: Unknown dimension. \n";
+      }
+    } else if (auto matmulOp = dyn_cast<ONNXMatMulOp>(s)) {
+      Location loc = matmulOp.getLoc();
+      // get operands
+      Value A = matmulOp.getA();
+      Value B = matmulOp.getB();
+
+      auto aTy = dyn_cast<RankedTensorType>(A.getType());
+      auto bTy = dyn_cast<RankedTensorType>(B.getType());
+
+      int64_t rankA = aTy.getRank();
+      int64_t rankB = bTy.getRank();
+
+      auto elemTy = aTy.getElementType();
+      auto unrankedOutTy = UnrankedTensorType::get(elemTy);
+
+      int64_t outRank = std::max(rankA, rankB);
+
+      auto makeMatMul = [&](Value lhs, Value rhs) -> Value {
+        auto mm = builder.create<ONNXMatMulOp>(loc, unrankedOutTy, lhs, rhs);
+        return mm.getResult();
+      };
+
+      if (splitDim == 1) {
+        int64_t axisA = rankA - 2; // [..., M, K]에서 M
+        auto [A1, A2] = splitValue(builder, loc, A, axisA);
+        Value Y1 = makeMatMul(A1, B);
+        Value Y2 = makeMatMul(A2, B);
+      } else if (splitDim == 2) {
+        int64_t axisB = rankB - 1; // [..., K, N]에서 N
+        auto [B1, B2] = splitValue(builder, loc, B, axisB);
+        Value Y1 = makeMatMul(A, B1);
+        Value Y2 = makeMatMul(A, B2);
+      } else {
+        llvm::outs() << "[splitSubgraph] fail: Unknown Operation at S.\n";
+      }
+    }
+    /*------------split S node------------*/
+
+    /*------------split Subgraph------------*/
+
+    /*------------split Subgraph------------*/
   }
 
   // ----[ DEBUG (outs) helpers ]----
