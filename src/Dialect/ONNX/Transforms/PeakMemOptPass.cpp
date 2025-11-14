@@ -78,13 +78,13 @@ struct PeakMemOptPass
     subgraph expandShrinkSubgraph =
         matchExpandShrinkPattern(peakOp, DETECTION_SCOPE);
 
-    if (!expandShrinkSubgraph.s) {
+    if (!expandShrinkSubgraph.getS()) {
       llvm::outs() << "[match Expand/Shrink] no window\n";
     } else {
       llvm::outs() << "[match Expand/Shrink] SPLITTABLE window: S=";
-      printOpOneLine(expandShrinkSubgraph.s);
+      printOpOneLine(expandShrinkSubgraph.getS());
       llvm::outs() << "  E=";
-      printOpOneLine(expandShrinkSubgraph.e);
+      printOpOneLine(expandShrinkSubgraph.getE());
       llvm::outs() << "\n";
     }
     /* ---------------Expand/Shrink--------------- */
@@ -105,11 +105,11 @@ struct PeakMemOptPass
 
     /* ---------------Merge/Shrink--------------- */
     subgraph mergeShrinkSubgraph = matchMergeShrinkPattern(peakOp);
-    if (mergeShrinkSubgraph.s) {
+    if (mergeShrinkSubgraph.getS()) {
       llvm::outs() << "[match Merge/Shrink] SPLITTABLE window: S=";
-      printOpOneLine(mergeShrinkSubgraph.s);
+      printOpOneLine(mergeShrinkSubgraph.getS());
       llvm::outs() << "  E=";
-      printOpOneLine(mergeShrinkSubgraph.e);
+      printOpOneLine(mergeShrinkSubgraph.getE());
       llvm::outs() << "\n";
     } else {
       llvm::outs() << "[match Merge/Shrink] no window\n";
@@ -117,7 +117,7 @@ struct PeakMemOptPass
     /* ---------------Merge/Shrink--------------- */
 
     /* ===============Check Splittability=============== */
-    if (expandShrinkSubgraph.s) {
+    if (expandShrinkSubgraph.getS()) {
       llvm::DenseSet<int64_t> splittableDims =
           getSplittableDims(expandShrinkSubgraph);
 
@@ -127,10 +127,10 @@ struct PeakMemOptPass
       }
       llvm::outs() << '\n';
     }
-    // if (forkJoinSubgraph.s) {
+    // if (forkJoinSubgraph.getS()) {
     //   // TODO:
     // }
-    // if (mergeShrinkSubgraph.s) {
+    // if (mergeShrinkSubgraph.getS()) {
     //   // TODO:
     // }
     /* ===============Check Splittability=============== */
@@ -157,11 +157,24 @@ private:
   };
 
   struct subgraph {
-    Operation *s = nullptr; // start node
-    Operation *e = nullptr; // End node
-    llvm::DenseSet<Operation *>
+    llvm::SetVector<Operation *>
         subgraphNodes;           // All ops in s→e path including s and e
     int64_t splitDimension = -1; // Dimension to split along
+
+    Operation *getS() {
+      return subgraphNodes.empty() ? nullptr : subgraphNodes.front();
+    }
+    const Operation *getS() const {
+      return subgraphNodes.empty() ? nullptr : subgraphNodes.front();
+    }
+
+    Operation *getE() {
+      // 비어있는지 확인 후 마지막 요소 반환
+      return subgraphNodes.empty() ? nullptr : subgraphNodes.back();
+    }
+    const Operation *getE() const {
+      return subgraphNodes.empty() ? nullptr : subgraphNodes.back();
+    }
   };
 
   // TensorType 크기 계산: byte단위의 사이즈 반환
@@ -340,7 +353,7 @@ private:
   }
 
   // s에서 시작해 e로 끝나는 서브 그래프 노드 집합 반환
-  static llvm::DenseSet<Operation *> getSubgraphNodes(
+  static llvm::SetVector<Operation *> getSubgraphNodes(
       Operation *s, Operation *e) {
     if (!s) {
       llvm::outs() << "[getSubgraphNodes] s = nullptr \n";
@@ -351,25 +364,23 @@ private:
       return {};
     }
 
-    llvm::DenseSet<mlir::Operation *> forwardSet =
-        getForwardReachableNodes(s, e);
+    llvm::DenseSet<Operation *> forwardSet = getForwardReachableNodes(s, e);
 
-    llvm::DenseSet<mlir::Operation *> backwardSet =
-        getBackwardReachableNodes(s, e);
+    llvm::DenseSet<Operation *> backwardSet = getBackwardReachableNodes(s, e);
 
-    llvm::DenseSet<mlir::Operation *> subgraphNodes;
+    llvm::SetVector<Operation *> subgraphNodes;
     for (mlir::Operation *op : forwardSet) {
       if (backwardSet.contains(op)) {
         subgraphNodes.insert(op);
       }
     }
 
-    return subgraphNodes;
+    return topologicalSort(subgraphNodes);
   }
 
   // 서브그래프 고립성 검사
   static IsolateStatus isIsolatedSubgraph(Operation *s, Operation *e) {
-    llvm::DenseSet<Operation *> subgraphNodes = getSubgraphNodes(s, e);
+    llvm::SetVector<Operation *> subgraphNodes = getSubgraphNodes(s, e);
 
     // I/O 검사
     for (Operation *op : subgraphNodes) {
@@ -562,9 +573,7 @@ private:
     printOpOneLine(shrinker);
     llvm::outs() << "\n";
 
-    return subgraph{.s = expander,
-        .e = shrinker,
-        .subgraphNodes = getSubgraphNodes(expander, shrinker)};
+    return subgraph{.subgraphNodes = getSubgraphNodes(expander, shrinker)};
 
     // S~E까지 몇 개의 op를 split해야하며
     // 최적화로 얻는 이득은 얼마인지?(peak memory reduction)
@@ -918,9 +927,7 @@ private:
       }
     }
 
-    return subgraph{.s = concatOp,
-        .e = shrinker,
-        .subgraphNodes = getSubgraphNodes(concatOp, shrinker)};
+    return subgraph{.subgraphNodes = getSubgraphNodes(concatOp, shrinker)};
   }
 
   /*=========opimize logic=========*/
@@ -1057,11 +1064,11 @@ private:
   llvm::DenseSet<int64_t> getSplittableDims(subgraph &subgraph) {
     llvm::DenseSet<int64_t> splittableDims;
 
-    if (subgraph.s->getNumResults() != 1) {
+    if (subgraph.getS()->getNumResults() != 1) {
       llvm::outs() << "[getSplittableDims] Fail: s has multiple results. \n";
     }
 
-    Value sOut = subgraph.s->getResult(0);
+    Value sOut = subgraph.getS()->getResult(0);
     TensorType tensorType = dyn_cast<RankedTensorType>(sOut.getType());
     int64_t rank = tensorType.getRank();
     llvm::outs() << "[getSplittableDims] Rank: " << rank << "\n";
@@ -1072,7 +1079,7 @@ private:
       bool preserved = false;
 
       for (Operation *op : userOps) {
-        preserved = isDimPreserved(op, i, subgraph.e);
+        preserved = isDimPreserved(op, i, subgraph.getE());
         if (!preserved) {
           break;
         }
@@ -1086,25 +1093,25 @@ private:
   }
 
   int64_t determineSplitAxis(subgraph &subgraph) {
-    if (subgraph.s->getNumResults() != 1) {
+    if (subgraph.getS()->getNumResults() != 1) {
       llvm::outs() << "[determineSplitAxis] Fail: s has multiple results. \n";
     }
 
-    Value sOutput = subgraph.s->getResult(0);
+    Value sOutput = subgraph.getS()->getResult(0);
     auto tensorType = dyn_cast<TensorType>(sOutput.getType());
     ArrayRef<int64_t> shape = tensorType.getShape();
 
     // 1: Channel dimension (typically dim 1 for NCHW)
     int64_t dimension1 = shape[1];
     // s가 무슨 연산인지에 따라
-    if (auto matmulOp = dyn_cast<ONNXMatMulOp>(subgraph.s)) {
+    if (auto matmulOp = dyn_cast<ONNXMatMulOp>(subgraph.getS())) {
       // TODO: MatMul 처리 로직
 
-    } else if (auto convOp = dyn_cast<ONNXConvOp>(subgraph.s)) {
+    } else if (auto convOp = dyn_cast<ONNXConvOp>(subgraph.getS())) {
       // TODO: Conv 처리 로직
 
       // isa는 여러 타입을 동시에 확인 가능
-    } else if (isa<ONNXAddOp, ONNXClipOp>(subgraph.s)) {
+    } else if (isa<ONNXAddOp, ONNXClipOp>(subgraph.getS())) {
       // TODO: Add 또는 Clip 처리 로직
 
     } else {
@@ -1163,8 +1170,8 @@ private:
     llvm::outs() << "[splitSubgraph] Splitting subgraph at dimension "
                  << splitDim << "\n";
 
-    Operation *s = subgraph.s;
-    Operation *e = subgraph.e;
+    Operation *s = subgraph.getS();
+    Operation *e = subgraph.getE();
     OpBuilder builder(s->getContext());
 
     /*------------split S node------------*/
