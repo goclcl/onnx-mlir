@@ -1,10 +1,12 @@
-#include <algorithm>
+#include <cmath>
 #include <deque>
 #include <queue>
+#include <ranges>
 
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/Support/Casting.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include "mlir/Analysis/Liveness.h"
@@ -15,12 +17,16 @@
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Dominance.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/Types.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Support/LLVM.h"
 
+#include "src/Dialect/Mlir/DialectBuilder.hpp"
+#include "src/Dialect/ONNX/DialectBuilder.hpp"
 #include "src/Dialect/ONNX/ONNXOps.hpp"
+#include "src/Dialect/ONNX/ONNXOps/ShapeHelper.hpp"
 
 using namespace mlir;
 
@@ -136,7 +142,7 @@ struct PeakMemOptPass
     /* ===============Check Splittability=============== */
 
     /* ===============Split=============== */
-
+    splitSubgraph(expandShrinkSubgraph, 1);
     /* ===============Split=============== */
   }
 
@@ -1102,7 +1108,7 @@ private:
     ArrayRef<int64_t> shape = tensorType.getShape();
 
     // 1: Channel dimension (typically dim 1 for NCHW)
-    int64_t dimension1 = shape[1];
+    // int64_t dimension1 = shape[1];
     // s가 무슨 연산인지에 따라
     if (auto matmulOp = dyn_cast<ONNXMatMulOp>(subgraph.getS())) {
       // TODO: MatMul 처리 로직
@@ -1172,7 +1178,11 @@ private:
 
     Operation *s = subgraph.getS();
     Operation *e = subgraph.getE();
-    OpBuilder builder(s->getContext());
+    OpBuilder builder(s);
+    Location loc = s->getLoc();
+    onnx_mlir::MultiDialectBuilder<onnx_mlir::OnnxBuilder> create(builder, loc);
+
+    Value Y1, Y2;
 
     /*------------split S node------------*/
     if (auto convOp = dyn_cast<ONNXConvOp>(s)) {
@@ -1206,13 +1216,15 @@ private:
         int64_t g2 = g / 2;
         int64_t g1 = g - g2;
 
-        IntegerAttr group1 = builder.getI64IntegerAttr(g1);
-        IntegerAttr group2 = builder.getI64IntegerAttr(g2);
+        // si64 type 만들기
+        auto si64Ty =
+            IntegerType::get(builder.getContext(), 64, IntegerType::Signed);
+        IntegerAttr group1 = IntegerAttr::get(si64Ty, g1);
+        IntegerAttr group2 = IntegerAttr::get(si64Ty, g2);
 
         // Make Op
-        builder.setInsertionPoint(s);
-        Value Y1 = makeConv(x, w1, b1, group1);
-        Value Y2 = makeConv(x, w2, b2, group2);
+        Y1 = makeConv(x, w1, b1, group1);
+        Y2 = makeConv(x, w2, b2, group2);
       }
       // height, width
       else if (splitDim == 2 || splitDim == 3) {
@@ -1235,7 +1247,7 @@ private:
       auto elemTy = aTy.getElementType();
       auto unrankedOutTy = UnrankedTensorType::get(elemTy);
 
-      int64_t outRank = std::max(rankA, rankB);
+      // int64_t outRank = std::max(rankA, rankB);
 
       auto makeMatMul = [&](Value lhs, Value rhs) -> Value {
         auto mm = builder.create<ONNXMatMulOp>(loc, unrankedOutTy, lhs, rhs);
@@ -1245,22 +1257,246 @@ private:
       if (splitDim == 1) {
         int64_t axisA = rankA - 2; // [..., M, K]에서 M
         auto [A1, A2] = splitValue(builder, loc, A, axisA);
-        Value Y1 = makeMatMul(A1, B);
-        Value Y2 = makeMatMul(A2, B);
+        Y1 = makeMatMul(A1, B);
+        Y2 = makeMatMul(A2, B);
       } else if (splitDim == 2) {
         int64_t axisB = rankB - 1; // [..., K, N]에서 N
         auto [B1, B2] = splitValue(builder, loc, B, axisB);
-        Value Y1 = makeMatMul(A, B1);
-        Value Y2 = makeMatMul(A, B2);
+        Y1 = makeMatMul(A, B1);
+        Y2 = makeMatMul(A, B2);
       } else {
         llvm::outs() << "[splitSubgraph] fail: Unknown Operation at S.\n";
       }
     }
     /*------------split S node------------*/
 
-    /*------------split Subgraph------------*/
+    /*------------서브그래프 경로 A 복제------------*/
+    Value sOut = s->getResult(0);
 
-    /*------------split Subgraph------------*/
+    IRMapping mappingA;
+    mappingA.map(sOut, Y1);
+
+    builder.setInsertionPointAfterValue(Y1);
+
+    // 첫 번째 노드 건너뛰고 시작
+    for (Operation *op : llvm::drop_begin(subgraph.subgraphNodes, 1)) {
+      Operation *clonedOp = builder.clone(*op, mappingA);
+
+      // convOp일 경우
+      if (auto convOp = dyn_cast<ONNXConvOp>(clonedOp)) {
+        if (splitDim == 1) {
+          // insertion point
+          builder.setInsertionPoint(convOp);
+          // weight 교체
+          Value w = convOp.getW();
+          auto [w1, w2] = splitValue(builder, convOp.getLoc(), w, 0);
+          convOp.setOperand(1, w1);
+
+          // bias 교체
+          Value b = convOp.getB();
+          auto [b1, b2] = splitValue(builder, convOp.getLoc(), b, 0);
+          convOp.setOperand(2, b1);
+
+          // group attr 교체
+          auto si64Ty =
+              IntegerType::get(builder.getContext(), 64, IntegerType::Signed);
+          auto newGroupAttr = IntegerAttr::get(
+              si64Ty, dyn_cast<TensorType>(w1.getType()).getShape()[0]);
+          convOp.setGroupAttr(newGroupAttr);
+        }
+        // reshapeOp일 경우
+      } else if (auto reshapeOp = dyn_cast<ONNXReshapeOp>(clonedOp)) {
+        Value shapeVal = reshapeOp.getShape();
+        auto constOp = dyn_cast<ONNXConstantOp>(shapeVal.getDefiningOp());
+        if (!constOp) {
+          llvm::errs()
+              << "[splitSubgraph] reshape shape is not ONNXConstantOp\n";
+          return;
+        }
+
+        builder.setInsertionPoint(constOp);
+
+        // ONNXConstantOp 의 value attr 꺼내기
+        auto denseAttr = dyn_cast<DenseElementsAttr>(constOp.getValueAttr());
+        if (!denseAttr) {
+          llvm::errs() << "[splitSubgraph] constant is not DenseElementsAttr\n";
+          return;
+        }
+        // i64 리스트로 변환
+        SmallVector<int64_t, 4> shapeVals;
+        for (int64_t v : denseAttr.getValues<int64_t>())
+          shapeVals.push_back(v);
+        if (shapeVals[splitDim] % 2 != 0) {
+          llvm::errs() << "[splitSubgraph] dim not divisible by 2: "
+                       << shapeVals[splitDim] << "\n";
+          return;
+        }
+
+        // 해당 dimension을 2로 나누기
+        shapeVals[splitDim] /= 2;
+
+        // 새 ONNXConstantOp 생성
+        Value newConstVal =
+            create.onnx.constantInt64(llvm::ArrayRef<int64_t>(shapeVals));
+
+        // 이제 reshape의 두번째 인자를 새 상수로 교체
+        reshapeOp.setOperand(1, newConstVal);
+
+        // Add
+      } else if (auto addOp = dyn_cast<ONNXAddOp>(clonedOp)) {
+        builder.setInsertionPoint(addOp);
+        auto [b1, b2] = splitValue(builder, loc, addOp->getOperand(1), 1);
+        addOp.setOperand(1, b1);
+        // 기타
+      } else if (isa<ONNXClipOp>(clonedOp)) {
+        ;
+      }
+
+      // 결과 타입 수정
+      Value y = clonedOp->getResult(0);
+      auto elemType = dyn_cast<TensorType>(y.getType()).getElementType();
+      auto newType = UnrankedTensorType::get(elemType);
+
+      y.setType(newType);
+
+      // insertion point
+      builder.setInsertionPointAfter(clonedOp);
+    }
+    /*------------서브그래프 경로 A 복제------------*/
+
+    /*------------서브그래프 경로 B 복제------------*/
+    IRMapping mappingB;
+    mappingB.map(sOut, Y2);
+
+    builder.setInsertionPointAfterValue(Y2);
+
+    // 첫 번째 노드 건너뛰고 시작
+    for (Operation *op : llvm::drop_begin(subgraph.subgraphNodes, 1)) {
+      Operation *clonedOp = builder.clone(*op, mappingB);
+      // convOp일 경우
+      if (auto convOp = dyn_cast<ONNXConvOp>(clonedOp)) {
+        if (splitDim == 1) {
+          // insertion point
+          builder.setInsertionPoint(convOp);
+          // weight 교체
+          Value w = convOp.getW();
+          auto [w1, w2] = splitValue(builder, convOp.getLoc(), w, 0);
+          convOp.setOperand(1, w2);
+
+          // bias 교체
+          Value b = convOp.getB();
+          auto [b1, b2] = splitValue(builder, convOp.getLoc(), b, 0);
+          convOp.setOperand(2, b2);
+
+          // group attr 교체
+          auto si64Ty =
+              IntegerType::get(builder.getContext(), 64, IntegerType::Signed);
+          auto newGroupAttr = IntegerAttr::get(
+              si64Ty, dyn_cast<TensorType>(w2.getType()).getShape()[0]);
+          convOp.setGroupAttr(newGroupAttr);
+        }
+      } else if (auto reshapeOp = dyn_cast<ONNXReshapeOp>(clonedOp)) {
+        Value shapeVal = reshapeOp.getShape();
+        auto constOp = dyn_cast<ONNXConstantOp>(shapeVal.getDefiningOp());
+        if (!constOp) {
+          llvm::errs()
+              << "[splitSubgraph] reshape shape is not ONNXConstantOp\n";
+          return;
+        }
+
+        builder.setInsertionPoint(constOp);
+
+        // ONNXConstantOp 의 value attr 꺼내기
+        auto denseAttr = dyn_cast<DenseElementsAttr>(constOp.getValueAttr());
+        if (!denseAttr) {
+          llvm::errs() << "[splitSubgraph] constant is not DenseElementsAttr\n";
+          return;
+        }
+        // i64 리스트로 변환
+        SmallVector<int64_t, 4> shapeVals;
+        for (int64_t v : denseAttr.getValues<int64_t>())
+          shapeVals.push_back(v);
+        if (shapeVals[splitDim] % 2 != 0) {
+          llvm::errs() << "[splitSubgraph] dim not divisible by 2: "
+                       << shapeVals[splitDim] << "\n";
+          return;
+        }
+
+        // 해당 dimension을 2로 나누기
+        shapeVals[splitDim] /= 2;
+
+        // 새 ONNXConstantOp 생성
+        Value newConstVal =
+            create.onnx.constantInt64(llvm::ArrayRef<int64_t>(shapeVals));
+
+        // 이제 reshape의 두번째 인자를 새 상수로 교체
+        reshapeOp.setOperand(1, newConstVal);
+
+      } // Add
+      else if (auto addOp = dyn_cast<ONNXAddOp>(clonedOp)) {
+        builder.setInsertionPoint(addOp);
+        auto [b1, b2] = splitValue(builder, loc, addOp->getOperand(1), 1);
+        addOp.setOperand(1, b2);
+        // 기타
+      } else if (isa<ONNXClipOp>(clonedOp)) {
+        ;
+      }
+      // 결과 타입 수정
+      Value y = clonedOp->getResult(0);
+      auto elemType = dyn_cast<TensorType>(y.getType()).getElementType();
+      auto newType = UnrankedTensorType::get(elemType);
+
+      y.setType(newType);
+      // insertion point
+      builder.setInsertionPointAfter(clonedOp);
+    }
+    /*------------서브그래프 경로 B 복제------------*/
+
+    /*------------Concat 생성------------*/
+    builder.setInsertionPoint(s);
+
+    // 원래 서브그래프의 끝 op e 의 결과
+    Value oldOut = e->getResult(0);
+
+    // 브랜치 A/B에서 복제된 e 의 결과를 매핑에서 가져오기
+    Value outA = mappingA.lookup(oldOut);
+    Value outB = mappingB.lookup(oldOut);
+
+    auto elemTy = dyn_cast<TensorType>(outA.getType()).getElementType();
+    auto unrankedOutTy = UnrankedTensorType::get(elemTy);
+    IntegerAttr concatAxisAttr =
+        builder.getIntegerAttr(builder.getIntegerType(64, true), splitDim);
+    auto concatOp = builder.create<ONNXConcatOp>(
+        s->getLoc(), unrankedOutTy, ValueRange{outA, outB}, concatAxisAttr);
+
+    if (e->getNumResults() != 1) {
+      llvm::outs() << "[splitSubgraph] fail: E has multiple outputs.\n";
+      return;
+    }
+
+    // e의 result를 Concat의 result로 갈아끼우기
+    Value newOut = concatOp.getResult();
+
+    oldOut.replaceAllUsesWith(newOut);
+    /*------------Concat 생성------------*/
+
+    /*------------기존 연산 지우기------------*/
+    // subgraph의 연산들에 역순으로 접근
+    for (auto it = subgraph.subgraphNodes.rbegin(),
+              end = subgraph.subgraphNodes.rend();
+         it != end; it++) {
+      Operation *op = *it;
+      op->erase();
+    }
+    subgraph.subgraphNodes.clear();
+    // subgraph.subgraphNodes.pop_back_val();
+    // llvm::SetVector<Operation *> toErase;
+    // for (Operation *op : subgraph.subgraphNodes)
+    //   toErase.insert(op);
+    // for (Operation *op : toErase) {
+    //   op->erase();
+    // }
+    /*------------기존 연산 지우기------------*/
   }
 
   // ----[ DEBUG (outs) helpers ]----
