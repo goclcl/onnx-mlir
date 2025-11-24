@@ -1,4 +1,5 @@
 #include <cmath>
+#include <cstdint>
 #include <deque>
 #include <queue>
 #include <ranges>
@@ -27,6 +28,12 @@
 #include "src/Dialect/ONNX/DialectBuilder.hpp"
 #include "src/Dialect/ONNX/ONNXOps.hpp"
 #include "src/Dialect/ONNX/ONNXOps/ShapeHelper.hpp"
+
+/*
+Yolov10s에서 Fork/Merge pattern이 Expand/Shrink pattern으로도 detect됨. Mul이
+elementwise 연산이긴한데 operand 두개가 전부 중간 텐서라 텐서를 줄이는 연산으로
+보게됨. -> 이걸 어떻게 처리해야할까?
+*/
 
 using namespace mlir;
 
@@ -78,7 +85,7 @@ struct PeakMemOptPass
     /* ---------------Expand/Shrink--------------- */
     const uint32_t DETECTION_SCOPE = 64;
 
-    llvm::outs() << "[match] try EXPAND~SHRINK from peak, scope="
+    llvm::outs() << "[match Expand/Shrink] try EXPAND~SHRINK from peak, scope="
                  << DETECTION_SCOPE << "\n";
 
     subgraph expandShrinkSubgraph =
@@ -457,7 +464,7 @@ private:
     IsolateStatus status = IsolateStatus::None;
 
     // [outs] 시작
-    llvm::outs() << "[match] start: peak=";
+    llvm::outs() << "[match Expand/Shrink] start: peak=";
     printOpOneLine(peakOp);
     llvm::outs() << " scope=" << detectionScope << "\n";
 
@@ -548,7 +555,7 @@ private:
 
     while (status != IsolateStatus::Isolated) {
       if (detectionScope == 0) {
-        llvm::outs() << "[match] scope exhausted\n";
+        llvm::outs() << "[match Expand/Shrink] scope exhausted\n";
         return subgraph{};
       }
 
@@ -557,23 +564,24 @@ private:
         forwardSearch();
         status = isIsolatedSubgraph(expander, shrinker);
       } else if (status == IsolateStatus::ExternalInput) {
-        llvm::outs() << "[match] status=" << toString(status)
+        llvm::outs() << "[match Expand/Shrink] status=" << toString(status)
                      << " -> expand backward\n";
         backwardSearch();
         status = isIsolatedSubgraph(expander, shrinker);
       } else if (status == IsolateStatus::ExternalOutput) {
-        llvm::outs() << "[match] status=" << toString(status)
+        llvm::outs() << "[match Expand/Shrink] status=" << toString(status)
                      << " -> expand forward\n";
         forwardSearch();
         status = isIsolatedSubgraph(expander, shrinker);
       } else if (status == IsolateStatus::NotSplittable) {
-        llvm::outs() << "[match] NotSplittable\n";
+        llvm::outs() << "[match Expand/Shrink] NotSplittable\n";
         return subgraph{};
       }
-      llvm::outs() << "[match] status now=" << toString(status) << "\n";
+      llvm::outs() << "[match Expand/Shrink] status now=" << toString(status)
+                   << "\n";
     }
 
-    llvm::outs() << "[match] SPLITTABLE: S=";
+    llvm::outs() << "[match Expand/Shrink] SPLITTABLE: S=";
     printOpOneLine(expander);
     llvm::outs() << "  E=";
     printOpOneLine(shrinker);
@@ -1046,7 +1054,7 @@ private:
       return false;
     }
     // elementwise 연산일 경우
-    else if (isa<ONNXAddOp, ONNXClipOp>(op)) {
+    else if (isa<ONNXAddOp, ONNXClipOp, ONNXMulOp, ONNXSigmoidOp>(op)) {
       if (op == e) {
         return true;
       }
@@ -1098,6 +1106,7 @@ private:
     return splittableDims;
   }
 
+  // TODO:
   int64_t determineSplitAxis(subgraph &subgraph) {
     if (subgraph.getS()->getNumResults() != 1) {
       llvm::outs() << "[determineSplitAxis] Fail: s has multiple results. \n";
@@ -1171,8 +1180,60 @@ private:
     return {splitOp.getResult(0), splitOp.getResult(1)};
   }
 
+  // ConvOp를 받아서 타입을 문자열로 반환하는 함수
+  std::string getConvTypeName(ONNXConvOp op) {
+    // 1. Group 속성 확인
+    int64_t group = op.getGroup();
+
+    // 2. 입력 채널 수 확인
+    auto inputType = dyn_cast<mlir::RankedTensorType>(op.getX().getType());
+    if (!inputType)
+      return "Unknown (Unranked Input)";
+
+    int64_t inputChannels = inputType.getShape()[1]; // NCHW 기준
+
+    // 3. 커널 크기가 1x1인지 확인
+    auto weightType = dyn_cast<mlir::RankedTensorType>(op.getW().getType());
+    if (!weightType)
+      return "Unknown (Unranked Weight)";
+
+    llvm::ArrayRef<int64_t> weightShape = weightType.getShape();
+    bool is1x1 = true;
+
+    // ONNX Weight: [M, C/group, kH, kW] -> 인덱스 2부터 공간 차원
+    for (size_t i = 2; i < weightShape.size(); ++i) {
+      if (weightShape[i] != 1) {
+        is1x1 = false;
+        break;
+      }
+    }
+
+    // --- 판별 로직 ---
+
+    // Case 1: Depthwise Convolution
+    // (입력 채널이 1보다 크고, 그룹 수와 채널 수가 같은 경우)
+    if (group == inputChannels && inputChannels > 1) {
+      return "Depthwise";
+    }
+
+    // Case 2: Pointwise Convolution
+    // (1x1 커널이면서 그룹이 1인 경우)
+    if (is1x1 && group == 1) {
+      return "Pointwise";
+    }
+
+    // Case 3: Grouped Convolution
+    // (Depthwise는 아니지만 그룹이 나뉘어 있는 경우)
+    if (group > 1 && group < inputChannels) {
+      return "Grouped";
+    }
+
+    // Case 4: Standard Convolution
+    // (그 외 일반적인 경우)
+    return "Standard";
+  }
+
   void splitSubgraph(subgraph subgraph, int64_t splitDim) {
-    // TODO:
     llvm::outs() << "[splitSubgraph] Splitting subgraph at dimension "
                  << splitDim << "\n";
 
@@ -1185,6 +1246,7 @@ private:
     Value Y1, Y2;
 
     /*------------split S node------------*/
+    // S == ConvOp일 경우
     if (auto convOp = dyn_cast<ONNXConvOp>(s)) {
       Location loc = convOp.getLoc();
       // get operands and attrs
@@ -1211,20 +1273,9 @@ private:
         auto [w1, w2] = splitValue(builder, loc, w, 0);
         auto [b1, b2] = splitValue(builder, loc, b, 0);
 
-        // Set group attrs
-        int64_t g = group.getInt();
-        int64_t g2 = g / 2;
-        int64_t g1 = g - g2;
-
-        // si64 type 만들기
-        auto si64Ty =
-            IntegerType::get(builder.getContext(), 64, IntegerType::Signed);
-        IntegerAttr group1 = IntegerAttr::get(si64Ty, g1);
-        IntegerAttr group2 = IntegerAttr::get(si64Ty, g2);
-
         // Make Op
-        Y1 = makeConv(x, w1, b1, group1);
-        Y2 = makeConv(x, w2, b2, group2);
+        Y1 = makeConv(x, w1, b1, group);
+        Y2 = makeConv(x, w2, b2, group);
       }
       // height, width
       else if (splitDim == 2 || splitDim == 3) {
@@ -1232,7 +1283,9 @@ private:
       } else {
         llvm::outs() << "[splitSubgraph] fail: Unknown dimension. \n";
       }
-    } else if (auto matmulOp = dyn_cast<ONNXMatMulOp>(s)) {
+    }
+    // S == MatMulOp일 경우
+    else if (auto matmulOp = dyn_cast<ONNXMatMulOp>(s)) {
       Location loc = matmulOp.getLoc();
       // get operands
       Value A = matmulOp.getA();
@@ -1267,6 +1320,10 @@ private:
       } else {
         llvm::outs() << "[splitSubgraph] fail: Unknown Operation at S.\n";
       }
+    }
+    // S == ConcatOp일 경우
+    else if (auto concatOp = dyn_cast<ONNXConcatOp>(s)) {
+      ;
     }
     /*------------split S node------------*/
 
@@ -1342,13 +1399,19 @@ private:
         // 이제 reshape의 두번째 인자를 새 상수로 교체
         reshapeOp.setOperand(1, newConstVal);
 
-        // Add
-      } else if (auto addOp = dyn_cast<ONNXAddOp>(clonedOp)) {
-        builder.setInsertionPoint(addOp);
-        auto [b1, b2] = splitValue(builder, loc, addOp->getOperand(1), 1);
-        addOp.setOperand(1, b1);
-        // 기타
-      } else if (isa<ONNXClipOp>(clonedOp)) {
+      }
+      // elementwise 연산일 경우 operand가 constant라면 split
+      else if (isa<ONNXAddOp, ONNXMulOp>(clonedOp)) {
+        uint64_t idx = 0;
+        for (Value v : clonedOp->getOperands()) {
+          Operation *defOp = v.getDefiningOp();
+          if (isa<ONNXConstantOp>(defOp)) {
+            auto [x1, x2] = splitValue(builder, loc, v, splitDim);
+            clonedOp->setOperand(idx, x1);
+          }
+          idx++;
+        }
+      } else if (isa<ONNXClipOp, ONNXSigmoidOp>(clonedOp)) {
         ;
       }
 
@@ -1432,13 +1495,19 @@ private:
         // 이제 reshape의 두번째 인자를 새 상수로 교체
         reshapeOp.setOperand(1, newConstVal);
 
-      } // Add
-      else if (auto addOp = dyn_cast<ONNXAddOp>(clonedOp)) {
-        builder.setInsertionPoint(addOp);
-        auto [b1, b2] = splitValue(builder, loc, addOp->getOperand(1), 1);
-        addOp.setOperand(1, b2);
-        // 기타
-      } else if (isa<ONNXClipOp>(clonedOp)) {
+      }
+      // elementwise 연산일 경우 operand가 constant라면 split
+      else if (isa<ONNXAddOp, ONNXMulOp>(clonedOp)) {
+        uint64_t idx = 0;
+        for (Value v : clonedOp->getOperands()) {
+          Operation *defOp = v.getDefiningOp();
+          if (isa<ONNXConstantOp>(defOp)) {
+            auto [x1, x2] = splitValue(builder, loc, v, splitDim);
+            clonedOp->setOperand(idx, x1);
+          }
+          idx++;
+        }
+      } else if (isa<ONNXClipOp, ONNXSigmoidOp>(clonedOp)) {
         ;
       }
       // 결과 타입 수정
