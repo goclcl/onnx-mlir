@@ -2,12 +2,10 @@
 #include <cstdint>
 #include <deque>
 #include <queue>
-#include <ranges>
 
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
-#include "llvm/Support/Casting.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include "mlir/Analysis/Liveness.h"
@@ -143,13 +141,21 @@ struct PeakMemOptPass
     // if (forkJoinSubgraph.getS()) {
     //   // TODO:
     // }
-    // if (mergeShrinkSubgraph.getS()) {
-    //   // TODO:
-    // }
+    if (auto s = mergeShrinkSubgraph.getS()) {
+      // TODO:
+      ONNXConcatOp concatOp = dyn_cast<ONNXConcatOp>(s);
+      int64_t splitDim = concatOp.getAxis();
+      if (!isDimPreserved(s, splitDim, mergeShrinkSubgraph)) {
+        llvm::outs()
+            << "[split Merge/Shrink] Concat dimension is not splittable.\n";
+      } else {
+        optConcat(mergeShrinkSubgraph);
+      }
+    }
     /* ===============Check Splittability=============== */
 
     /* ===============Split=============== */
-    splitSubgraph(expandShrinkSubgraph, 1);
+    // splitSubgraph(expandShrinkSubgraph, 1);
     /* ===============Split=============== */
   }
 
@@ -292,10 +298,9 @@ private:
     return res;
   }
 
-  // --- 헬퍼 함수 1: S에서 E까지만 순방향 탐색 ---
-  // S에서 시작하여 도달 가능한 모든 노드 집합을 반환합니다.
-  // E 노드를 만나면, E는 집합에 포함하되 E의 사용자는 더 이상 탐색하지
-  // 않습니다.
+  // S에서 E까지만 순방향 탐색
+  // S에서 시작하여 도달 가능한 모든 노드 집합을 반환
+  // E 노드를 만나면, E는 집합에 포함하되 E의 사용자는 더 이상 탐색하지 않음
   static llvm::DenseSet<mlir::Operation *> getForwardReachableNodes(
       Operation *S, Operation *E) {
     llvm::DenseSet<mlir::Operation *> visitedSet;
@@ -327,10 +332,10 @@ private:
     return visitedSet;
   }
 
-  // --- 헬퍼 함수 2: E에서 S까지만 역방향 탐색 ---
-  // E에서 시작하여 E에 도달하는 모든 노드 집합을 반환합니다.
+  // E에서 S까지만 역방향 탐색
+  // E에서 시작하여 E에 도달하는 모든 노드 집합을 반환
   // S 노드를 만나면, S는 집합에 포함하되 S의 입력(operand)은 더 이상 탐색하지
-  // 않습니다.
+  // 않음
   static llvm::DenseSet<mlir::Operation *> getBackwardReachableNodes(
       mlir::Operation *S, mlir::Operation *E) {
     llvm::DenseSet<mlir::Operation *> visitedSet;
@@ -945,7 +950,14 @@ private:
   }
 
   /*=========opimize logic=========*/
-  static bool isDimPreserved(Operation *op, size_t dimension, Operation *e) {
+  static bool isDimPreserved(
+      Operation *op, size_t dimension, const subgraph &subgraph) {
+    const Operation *s = subgraph.getS();
+    const Operation *e = subgraph.getE();
+
+    if (op == e) {
+      return true;
+    }
     // Conv일 경우
     if (auto convOp = dyn_cast<ONNXConvOp>(op)) {
       // channel dimension일 경우
@@ -964,13 +976,9 @@ private:
         }
       }
 
-      if (op == e) {
-        return true;
-      }
-
       Value outVal = convOp.getResult();
       for (Operation *userOp : outVal.getUsers()) {
-        return isDimPreserved(userOp, dimension, e);
+        return isDimPreserved(userOp, dimension, subgraph);
       }
     }
     // MatMul일 경우
@@ -1006,13 +1014,9 @@ private:
         return false;
       }
 
-      if (op == e) {
-        return true;
-      }
-
       Value outVal = matmulOp.getResult();
       for (Operation *userOp : outVal.getUsers()) {
-        return isDimPreserved(userOp, dimension, e);
+        return isDimPreserved(userOp, dimension, subgraph);
       }
     }
     // Reshape일 경우
@@ -1042,7 +1046,8 @@ private:
           if (inputProd == outputProd) {
             Value outVal = reshapeOp.getResult();
             for (Operation *userOp : outVal.getUsers()) {
-              return isDimPreserved(userOp, i, e); // i == 바뀐 target dimension
+              return isDimPreserved(
+                  userOp, i, subgraph); // i == 바뀐 target dimension
             }
           }
         }
@@ -1052,6 +1057,17 @@ private:
       printOpOneLine(reshapeOp);
       llvm::outs() << "\n    Dimension: " << dimension << "\n";
       return false;
+    }
+    // concatOp일 경우
+    else if (auto concatOp = dyn_cast<ONNXConcatOp>(op)) {
+      if (s == concatOp) {
+        Value outVal = concatOp.getConcatResult();
+        for (Operation *userOp : outVal.getUsers()) {
+          return isDimPreserved(userOp, dimension, subgraph);
+        }
+      } else {
+        llvm::outs() << "[isDimPreserved] failed: Unexpected ConcatOp.\n";
+      }
     }
     // elementwise 연산일 경우
     else if (isa<ONNXAddOp, ONNXClipOp, ONNXMulOp, ONNXSigmoidOp>(op)) {
@@ -1066,7 +1082,7 @@ private:
       }
       Value outVal = op->getResult(0);
       for (Operation *userOp : outVal.getUsers()) {
-        return isDimPreserved(userOp, dimension, e);
+        return isDimPreserved(userOp, dimension, subgraph);
       }
     }
     llvm::outs() << "[isDimPreserved] Failed: Unknown Op: ";
@@ -1093,7 +1109,7 @@ private:
       bool preserved = false;
 
       for (Operation *op : userOps) {
-        preserved = isDimPreserved(op, i, subgraph.getE());
+        preserved = isDimPreserved(op, i, subgraph);
         if (!preserved) {
           break;
         }
@@ -1144,40 +1160,69 @@ private:
     return 0;
   }
 
-  static std::pair<Value, Value> splitValue(
-      OpBuilder &builder, Location loc, Value input, int64_t axis = 0) {
+  static SmallVector<Value, 4> splitValue(OpBuilder &builder, Location loc,
+      Value input, int64_t axis = 0, int64_t numOutputs = 2) {
+    SmallVector<Value, 4> results;
+
+    if (numOutputs <= 0) {
+      llvm::outs() << "[splitValue] fail: numOutputs must be > 0.\n";
+      return results;
+    }
+
     if (!input || isa<NoneType>(input.getType())) {
       Value none = builder.create<ONNXNoneOp>(loc).getResult();
-      return {none, none};
+      // 요청 개수만큼 none 채워서 리턴해도 되고,
+      // 지금은 그냥 비어 있는 results 리턴함.
+      for (int64_t i = 0; i < numOutputs; ++i)
+        results.push_back(none);
+      return results;
     }
+
     auto inputType = dyn_cast<RankedTensorType>(input.getType());
     if (!inputType || inputType.getRank() <= axis) {
       llvm::outs()
           << "[splitValue] fail: Input value is unranked or (rank < axis). \n";
-      return {nullptr, nullptr};
+      return results;
     }
+
     auto shape = inputType.getShape();
     auto elementTy = inputType.getElementType();
 
-    int64_t num_outputs = 2;
     int64_t totalSize = shape[axis];
-    int64_t secondSize = totalSize / num_outputs;
-    int64_t firstSize = totalSize - secondSize;
 
-    SmallVector<int64_t, 4> shapeA(shape.begin(), shape.end());
-    shapeA[axis] = firstSize;
-    SmallVector<int64_t, 4> shapeB(shape.begin(), shape.end());
-    shapeB[axis] = secondSize;
+    // ONNX Split에서 equal split을 쓰려면 나누어 떨어져야 함.
+    if (totalSize % numOutputs != 0) {
+      llvm::outs() << "[splitValue] fail: totalSize(" << totalSize
+                   << ") is not divisible by numOutputs(" << numOutputs
+                   << ").\n";
+      return results;
+    }
 
-    Type typeA = RankedTensorType::get(shapeA, elementTy);
-    Type typeB = RankedTensorType::get(shapeB, elementTy);
+    int64_t chunkSize = totalSize / numOutputs;
+
+    // 각 output의 타입 계산
+    SmallVector<Type, 4> outTypes;
+    outTypes.reserve(numOutputs);
+    for (int64_t i = 0; i < numOutputs; ++i) {
+      SmallVector<int64_t, 4> outShape(shape.begin(), shape.end());
+      outShape[axis] = chunkSize;
+      outTypes.push_back(RankedTensorType::get(outShape, elementTy));
+    }
 
     auto noneVal = builder.create<ONNXNoneOp>(loc).getResult();
-    auto splitOp = builder.create<ONNXSplitOp>(loc, TypeRange{typeA, typeB},
-        input, noneVal,
-        builder.getIntegerAttr(builder.getIntegerType(64, true), axis),
-        builder.getIntegerAttr(builder.getIntegerType(64, true), num_outputs));
-    return {splitOp.getResult(0), splitOp.getResult(1)};
+    auto axisAttr = builder.getIntegerAttr(
+        builder.getIntegerType(64, /*isSigned=*/true), axis);
+    auto numOutputsAttr = builder.getIntegerAttr(
+        builder.getIntegerType(64, /*isSigned=*/true), numOutputs);
+
+    auto splitOp = builder.create<ONNXSplitOp>(
+        loc, TypeRange(outTypes), input, noneVal, axisAttr, numOutputsAttr);
+
+    // 결과 value들 모아서 리턴
+    for (int64_t i = 0; i < numOutputs; ++i)
+      results.push_back(splitOp.getResult(i));
+
+    return results;
   }
 
   // ConvOp를 받아서 타입을 문자열로 반환하는 함수
@@ -1270,8 +1315,12 @@ private:
       // channel
       if (splitDim == 1) {
         // Split weight and bias
-        auto [w1, w2] = splitValue(builder, loc, w, 0);
-        auto [b1, b2] = splitValue(builder, loc, b, 0);
+        auto wSplits = splitValue(builder, loc, w, 0);
+        auto bSplits = splitValue(builder, loc, b, 0);
+        auto w1 = wSplits[0];
+        auto w2 = wSplits[1];
+        auto b1 = bSplits[0];
+        auto b2 = wSplits[1];
 
         // Make Op
         Y1 = makeConv(x, w1, b1, group);
@@ -1309,21 +1358,21 @@ private:
 
       if (splitDim == 1) {
         int64_t axisA = rankA - 2; // [..., M, K]에서 M
-        auto [A1, A2] = splitValue(builder, loc, A, axisA);
+        auto aSplits = splitValue(builder, loc, A, axisA);
+        auto A1 = aSplits[0];
+        auto A2 = aSplits[1];
         Y1 = makeMatMul(A1, B);
         Y2 = makeMatMul(A2, B);
       } else if (splitDim == 2) {
         int64_t axisB = rankB - 1; // [..., K, N]에서 N
-        auto [B1, B2] = splitValue(builder, loc, B, axisB);
+        auto bSplits = splitValue(builder, loc, B, axisB);
+        auto B1 = bSplits[0];
+        auto B2 = bSplits[1];
         Y1 = makeMatMul(A, B1);
         Y2 = makeMatMul(A, B2);
       } else {
         llvm::outs() << "[splitSubgraph] fail: Unknown Operation at S.\n";
       }
-    }
-    // S == ConcatOp일 경우
-    else if (auto concatOp = dyn_cast<ONNXConcatOp>(s)) {
-      ;
     }
     /*------------split S node------------*/
 
@@ -1346,12 +1395,14 @@ private:
           builder.setInsertionPoint(convOp);
           // weight 교체
           Value w = convOp.getW();
-          auto [w1, w2] = splitValue(builder, convOp.getLoc(), w, 0);
+          auto wSplits = splitValue(builder, convOp.getLoc(), w, 0);
+          auto w1 = wSplits[0];
           convOp.setOperand(1, w1);
 
           // bias 교체
           Value b = convOp.getB();
-          auto [b1, b2] = splitValue(builder, convOp.getLoc(), b, 0);
+          auto bSplits = splitValue(builder, convOp.getLoc(), b, 0);
+          auto b1 = bSplits[0];
           convOp.setOperand(2, b1);
 
           // group attr 교체
@@ -1406,7 +1457,8 @@ private:
         for (Value v : clonedOp->getOperands()) {
           Operation *defOp = v.getDefiningOp();
           if (isa<ONNXConstantOp>(defOp)) {
-            auto [x1, x2] = splitValue(builder, loc, v, splitDim);
+            auto xSplits = splitValue(builder, loc, v, splitDim);
+            auto x1 = xSplits[0];
             clonedOp->setOperand(idx, x1);
           }
           idx++;
@@ -1443,12 +1495,14 @@ private:
           builder.setInsertionPoint(convOp);
           // weight 교체
           Value w = convOp.getW();
-          auto [w1, w2] = splitValue(builder, convOp.getLoc(), w, 0);
+          auto wSplits = splitValue(builder, convOp.getLoc(), w, 0);
+          auto w2 = wSplits[1];
           convOp.setOperand(1, w2);
 
           // bias 교체
           Value b = convOp.getB();
-          auto [b1, b2] = splitValue(builder, convOp.getLoc(), b, 0);
+          auto bSplits = splitValue(builder, convOp.getLoc(), b, 0);
+          auto b2 = bSplits[1];
           convOp.setOperand(2, b2);
 
           // group attr 교체
@@ -1502,7 +1556,8 @@ private:
         for (Value v : clonedOp->getOperands()) {
           Operation *defOp = v.getDefiningOp();
           if (isa<ONNXConstantOp>(defOp)) {
-            auto [x1, x2] = splitValue(builder, loc, v, splitDim);
+            auto xSplits = splitValue(builder, loc, v, splitDim);
+            auto x1 = xSplits[2];
             clonedOp->setOperand(idx, x1);
           }
           idx++;
@@ -1514,8 +1569,8 @@ private:
       Value y = clonedOp->getResult(0);
       auto elemType = dyn_cast<TensorType>(y.getType()).getElementType();
       auto newType = UnrankedTensorType::get(elemType);
-
       y.setType(newType);
+
       // insertion point
       builder.setInsertionPointAfter(clonedOp);
     }
@@ -1545,7 +1600,6 @@ private:
 
     // e의 result를 Concat의 result로 갈아끼우기
     Value newOut = concatOp.getResult();
-
     oldOut.replaceAllUsesWith(newOut);
     /*------------Concat 생성------------*/
 
@@ -1566,6 +1620,153 @@ private:
     //   op->erase();
     // }
     /*------------기존 연산 지우기------------*/
+  }
+
+  void optConcat(subgraph mergeShrinkSubgraph) {
+    llvm::outs() << "[optConcat] Optimizing Merge/Shrink pattern.\n";
+
+    Operation *s = mergeShrinkSubgraph.getS();
+    Operation *e = mergeShrinkSubgraph.getE();
+
+    auto concatOp = dyn_cast<ONNXConcatOp>(s);
+    if (!concatOp) {
+      llvm::outs() << "[optConcat] fail: S node must be concatOp.\n";
+    }
+
+    int64_t splitDim = concatOp.getAxis();
+
+    OpBuilder builder(s);
+    Location loc = s->getLoc();
+    onnx_mlir::MultiDialectBuilder<onnx_mlir::OnnxBuilder> create(builder, loc);
+
+    Value concatResult = concatOp.getResult();
+
+    SmallVector<Value, 4> branchOutputs;
+
+    // 각 브랜치에서 새로 만든 마지막 op를 추적
+    Operation *prev = s;
+
+    // concat의 각 입력에 대해 브랜치 하나씩 만들기
+    auto inputs = concatOp.getInputs();
+    for (size_t i = 0; i < inputs.size(); i++) { // 또는 s->getOperands()
+      Value in = inputs[i];
+      IRMapping mapping;
+
+      // concat 결과를 이 브랜치의 입력으로 치환
+      mapping.map(concatResult, in);
+
+      // subgraphNodes: [S, op1, op2, ..., E] 라고 가정하고
+      for (Operation *op :
+          llvm::drop_begin(mergeShrinkSubgraph.subgraphNodes, 1)) {
+        // 원래 op 바로 뒤에 두는 대신, 이 브랜치의 prev 뒤에 붙이는 게 깔끔함
+        builder.setInsertionPointAfter(prev);
+
+        // 핵심 2: clone(*op, mapping) 사용
+        Operation *clonedOp = builder.clone(*op, mapping);
+
+        if (op != e) {
+          if (auto convOp = dyn_cast<ONNXConvOp>(clonedOp)) {
+            std::string convType = getConvTypeName(convOp);
+            if (splitDim == 1) {
+              if (convType == "Depthwise") {
+                // TODO:
+                //   - group attr 수정 -> in_channel로
+                //   - weight, bias 쪼개기
+              } else if (convType == "Grouped") {
+                llvm::outs() << "[optConv] fail: Unexpected grouped conv.\n";
+              }
+              // depthwise일 경우에만 split 가능
+              else {
+                llvm::outs() << "[optConv] fail: splitDim == 1 but conv is not "
+                                "depthwise.\n";
+                return;
+              }
+            } else if (splitDim == 2 || splitDim == 3) {
+              // TODO:
+            } else {
+              llvm::outs() << "[optConcat] fail: Unexpected splitDim: "
+                           << splitDim << "\n";
+            }
+          }
+        } else if (op == e) {
+          if (auto convOp = dyn_cast<ONNXConvOp>(clonedOp)) {
+            std::string convType = getConvTypeName(convOp);
+
+            if (splitDim == 1) {
+              if (convType == "Standard" || convType == "Pointwise") {
+                Value weight = convOp.getW();
+
+                // weight의 idx 1번 차원이 in_channels/group임
+                // 일단은 group 1이라고 가정함
+                // TODO: group이 1이 아닐경우 고려해서 수정
+                builder.setInsertionPoint(convOp);
+                auto splits =
+                    splitValue(builder, loc, weight, 1, inputs.size());
+                convOp->setOperand(1, splits[i]);
+                builder.setInsertionPointAfter(convOp);
+              } else if (convType == "Depthwise") {
+                // TODO:
+                llvm::outs() << "[optConcat] Depthwise convolution \n";
+              } else if (convType == "Grouped") {
+                llvm::outs() << "[optConcat] fail: Unexpected grouped conv "
+                                "at E node.\n";
+              }
+            } else if (splitDim == 2 || splitDim == 3) {
+              // TODO:
+              //  height, width로 쪼갤때
+            } else {
+              llvm::outs() << "[optConcat] fail: Unexpected splitDim: "
+                           << splitDim << "\n";
+            }
+          }
+        }
+        // 결과 타입 수정
+        Value y = clonedOp->getResult(0);
+        auto elemType = dyn_cast<TensorType>(y.getType()).getElementType();
+        auto newType = UnrankedTensorType::get(elemType);
+        y.setType(newType);
+
+        prev = clonedOp;
+      }
+
+      // E에 해당하는 op가 마지막에 클론되었을 테니까
+      // 그 결과를 나중에 다시 합치거나 쓸 수 있음
+      branchOutputs.push_back(prev->getResult(0));
+    }
+
+    // branchOutputs 합치기
+    // 현재 E가 standard conv일 경우에 대해서면 구현 (Add로 합침)
+    // TODO:
+    //  - 나머지 conv에 대해서는 concat으로 합치고
+    //  - MatMul일 경우에는 splitDim이 reduction axis라면 sum, 아니면 concat으로
+    //    합치면 됨
+    if (auto convOp = dyn_cast<ONNXConvOp>(e)) {
+      std::string convType = getConvTypeName(convOp);
+      if (splitDim == 1) {
+        if (convType == "Standard" || convType == "Pointwise") {
+          Value y = convOp.getY();
+          auto elemType = dyn_cast<TensorType>(y.getType()).getElementType();
+          auto newType = UnrankedTensorType::get(elemType);
+          Value sumResult = create.onnx.sum(newType, branchOutputs);
+
+          // e의 result를 sum의 result로 갈아끼우기
+          y.replaceAllUsesWith(sumResult);
+        }
+      }
+    }
+
+    /*------------기존 연산 지우기------------*/
+    // subgraph의 연산들에 역순으로 접근
+    for (auto it = mergeShrinkSubgraph.subgraphNodes.rbegin(),
+              end = mergeShrinkSubgraph.subgraphNodes.rend();
+         it != end; it++) {
+      Operation *op = *it;
+      op->erase();
+    }
+    mergeShrinkSubgraph.subgraphNodes.clear();
+
+    llvm::outs()
+        << "[optConcat] Merge/Shrink pattern is successfully optimized.\n";
   }
 
   // ----[ DEBUG (outs) helpers ]----
