@@ -55,7 +55,6 @@ struct PeakMemOptPass
     /* ===============Peak 탐색=============== */
     Operation *peakOp = nullptr;
     int64_t peakBytes = -1;
-
     funcOp.walk([&](Operation *op) {
       // onnx.Constant와 func.func op는 스킵
       if (isa<ONNXConstantOp>(op) || isa<func::FuncOp>(op))
@@ -1700,9 +1699,13 @@ private:
                 // 일단은 group 1이라고 가정함
                 // TODO: group이 1이 아닐경우 고려해서 수정
                 builder.setInsertionPoint(convOp);
+                Value noneValue = builder.create<ONNXNoneOp>(convOp.getLoc());
                 auto splits =
                     splitValue(builder, loc, weight, 1, inputs.size());
-                convOp->setOperand(1, splits[i]);
+                convOp.setOperand(1, splits[i]);
+                if (i != 0) {
+                  convOp.setOperand(2, noneValue);
+                }
                 builder.setInsertionPointAfter(convOp);
               } else if (convType == "Depthwise") {
                 // TODO:
