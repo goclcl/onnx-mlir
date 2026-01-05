@@ -4,6 +4,7 @@
 #include <queue>
 
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/raw_ostream.h"
@@ -27,12 +28,6 @@
 #include "src/Dialect/ONNX/ONNXOps.hpp"
 #include "src/Dialect/ONNX/ONNXOps/ShapeHelper.hpp"
 
-/*
-Yolov10s에서 Fork/Merge pattern이 Expand/Shrink pattern으로도 detect됨. Mul이
-elementwise 연산이긴한데 operand 두개가 전부 중간 텐서라 텐서를 줄이는 연산으로
-보게됨. -> 이걸 어떻게 처리해야할까?
-*/
-
 using namespace mlir;
 
 namespace {
@@ -53,6 +48,8 @@ struct PeakMemOptPass
     // auto &postDomInfo = getAnalysis<PostDominanceInfo>();
 
     /* ===============Peak 탐색=============== */
+    llvm::outs()
+        << "\n================ 1. Search for Peak Operation ================\n";
     Operation *peakOp = nullptr;
     int64_t peakBytes = -1;
     funcOp.walk([&](Operation *op) {
@@ -68,30 +65,24 @@ struct PeakMemOptPass
       }
     });
 
-    if (!peakOp) {
-      llvm::outs() << "[PeakMemOptPass] No operation found.\n";
-      return;
-    }
-
     llvm::outs() << "[peak]" << peakBytes << "B at ";
     printOpOneLine(peakOp);
     llvm::outs() << "\n";
 
     /* ===============Optimizable Patterns 탐색=============== */
+    llvm::outs() << "\n================ 2. Detect Optimizable Patterns "
+                    "================\n";
 
     /* ---------------Expand/Shrink--------------- */
     const uint32_t DETECTION_SCOPE = 64;
-
-    llvm::outs() << "[match Expand/Shrink] try EXPAND~SHRINK from peak, scope="
-                 << DETECTION_SCOPE << "\n";
 
     subgraph expandShrinkSubgraph =
         matchExpandShrinkPattern(peakOp, DETECTION_SCOPE);
 
     if (!expandShrinkSubgraph.getS()) {
-      llvm::outs() << "[match Expand/Shrink] no window\n";
+      llvm::outs() << "[detect Expand/Shrink] no matched pattern\n";
     } else {
-      llvm::outs() << "[match Expand/Shrink] SPLITTABLE window: S=";
+      llvm::outs() << "[detect Expand/Shrink] splittable subgraph: S=";
       printOpOneLine(expandShrinkSubgraph.getS());
       llvm::outs() << "  E=";
       printOpOneLine(expandShrinkSubgraph.getE());
@@ -103,26 +94,27 @@ struct PeakMemOptPass
     IsolatedSubgraph isolatedSubgraph;
 
     if (matchForkJoinPattern(peakOp, funcOp, isolatedSubgraph)) {
-      llvm::outs() << "[match Fork/Merge] SPLITTABLE window: S=";
+      llvm::outs() << "[detect Fork/Merge] splittable subgraph: S=";
       printOpOneLine(isolatedSubgraph.entryGate);
       llvm::outs() << "  E=";
       printOpOneLine(isolatedSubgraph.exitGate);
       llvm::outs() << "\n";
     } else {
-      llvm::outs() << "[match Fork/Merge] no window\n";
+      llvm::outs() << "[detect Fork/Merge] no matched pattern\n";
     }
     /* ---------------Fork/Join--------------- */
 
     /* ---------------Merge/Shrink--------------- */
     subgraph mergeShrinkSubgraph = matchMergeShrinkPattern(peakOp);
+
     if (mergeShrinkSubgraph.getS()) {
-      llvm::outs() << "[match Merge/Shrink] SPLITTABLE window: S=";
+      llvm::outs() << "[detect Merge/Shrink] splittable subgraph: S=";
       printOpOneLine(mergeShrinkSubgraph.getS());
       llvm::outs() << "  E=";
       printOpOneLine(mergeShrinkSubgraph.getE());
       llvm::outs() << "\n";
     } else {
-      llvm::outs() << "[match Merge/Shrink] no window\n";
+      llvm::outs() << "[detect Merge/Shrink] no matched pattern\n";
     }
     /* ---------------Merge/Shrink--------------- */
 
@@ -179,6 +171,13 @@ private:
         subgraphNodes;           // All ops in s→e path including s and e
     int64_t splitDimension = -1; // Dimension to split along
 
+    // constructors
+    subgraph() = default;
+
+    subgraph(Operation *s, Operation *e) {
+      subgraphNodes = getSubgraphNodes(s, e);
+    }
+
     Operation *getS() {
       return subgraphNodes.empty() ? nullptr : subgraphNodes.front();
     }
@@ -187,7 +186,6 @@ private:
     }
 
     Operation *getE() {
-      // 비어있는지 확인 후 마지막 요소 반환
       return subgraphNodes.empty() ? nullptr : subgraphNodes.back();
     }
     const Operation *getE() const {
@@ -219,7 +217,7 @@ private:
       if (d == ShapedType::kDynamic) {
         // 동적 차원 발견 시 에러
         llvm::errs()
-            << "[PeakMemOptPass] Error: dynamic dimension found in type: " << tt
+            << "[PeakMemOptPass] fail: dynamic dimension found in type: " << tt
             << "\n";
         return -1;
       }
@@ -232,7 +230,7 @@ private:
   static int64_t getLiveTensorsSize(Operation *op, Liveness &liveness) {
     const LivenessBlockInfo *blk = liveness.getLiveness(op->getBlock());
     if (!blk) {
-      llvm::outs() << "[getLiveTensorsSize] !blk" << '\n';
+      llvm::outs() << "[getLiveTensorsSize] fail: !blk" << '\n';
       return 0;
     }
 
@@ -288,74 +286,66 @@ private:
       res = TensorSizeChange::SAME;
     }
 
-    llvm::outs() << "[checkTensorSizeChange] ";
-    printOpOneLine(op);
-    llvm::outs() << " in=" << totalInputSize << "B"
-                 << " out=" << totalOutputSize << "B"
-                 << " -> " << toString(res) << "\n";
-
     return res;
   }
 
   // S에서 E까지만 순방향 탐색
   // S에서 시작하여 도달 가능한 모든 노드 집합을 반환
   // E 노드를 만나면, E는 집합에 포함하되 E의 사용자는 더 이상 탐색하지 않음
-  static llvm::DenseSet<mlir::Operation *> getForwardReachableNodes(
-      Operation *S, Operation *E) {
-    llvm::DenseSet<mlir::Operation *> visitedSet;
-    std::deque<mlir::Operation *> worklist;
+  static llvm::DenseSet<Operation *> getForwardReachableNodes(
+      Operation *s, Operation *e) {
+    llvm::DenseSet<Operation *> visitedSet;
+    std::deque<Operation *> worklist;
 
-    worklist.push_back(S);
-    visitedSet.insert(S);
+    worklist.push_back(s);
+    visitedSet.insert(s);
 
     while (!worklist.empty()) {
-      mlir::Operation *currentOp = worklist.front();
+      Operation *currentOp = worklist.front();
       worklist.pop_front();
 
-      // E에 도달하면, E의 자식(user) 노드들은 탐색 큐에 넣지 않습니다.
-      if (currentOp == E) {
+      // E에 도달하면, E의 자식(user) 노드들은 탐색 큐에 넣지 않음
+      if (currentOp == e) {
         continue;
       }
 
-      for (Value result : currentOp->getResults()) {
-        for (Operation *userOp : result.getUsers()) {
-          // 이미 방문한 노드는 스킵
-          if (visitedSet.contains(userOp)) {
-            continue;
-          }
-          visitedSet.insert(userOp);
-          worklist.push_back(userOp);
+      for (Operation *userOp : currentOp->getUsers()) {
+        // 이미 방문한 노드는 스킵
+        if (visitedSet.contains(userOp)) {
+          continue;
         }
+        visitedSet.insert(userOp);
+        worklist.push_back(userOp);
       }
     }
     return visitedSet;
   }
 
   // E에서 S까지만 역방향 탐색
-  // E에서 시작하여 E에 도달하는 모든 노드 집합을 반환
+  // E에서 시작하여 S에 도달하는 모든 노드 집합을 반환
   // S 노드를 만나면, S는 집합에 포함하되 S의 입력(operand)은 더 이상 탐색하지
   // 않음
-  static llvm::DenseSet<mlir::Operation *> getBackwardReachableNodes(
-      mlir::Operation *S, mlir::Operation *E) {
-    llvm::DenseSet<mlir::Operation *> visitedSet;
-    std::deque<mlir::Operation *> worklist;
+  static llvm::DenseSet<Operation *> getBackwardReachableNodes(
+      Operation *s, Operation *e) {
+    llvm::DenseSet<Operation *> visitedSet;
+    std::deque<Operation *> worklist;
 
-    worklist.push_back(E);
-    visitedSet.insert(E);
+    worklist.push_back(e);
+    visitedSet.insert(e);
 
     while (!worklist.empty()) {
       mlir::Operation *currentOp = worklist.front();
       worklist.pop_front();
 
-      // S에 도달하면, S의 부모(operand) 노드들은 탐색 큐에 넣지 않습니다.
-      if (currentOp == S) {
+      // S에 도달하면, S의 부모(operand) 노드들은 탐색 큐에 넣지 않음
+      if (currentOp == s) {
         continue;
       }
 
-      for (mlir::Value operand : currentOp->getOperands()) {
-        mlir::Operation *defOp = operand.getDefiningOp();
+      for (Value operand : currentOp->getOperands()) {
+        Operation *defOp = operand.getDefiningOp();
 
-        // Block Argument이거나 이미 방문한 노드는 스킵
+        // Block Argument(그래프 전체 입력 값)이거나 이미 방문한 노드는 스킵
         // constant와 noValue op도 스킵
         if (!defOp || visitedSet.contains(defOp) ||
             isa<ONNXConstantOp>(defOp) || isa<ONNXNoneOp>(defOp)) {
@@ -369,15 +359,15 @@ private:
     return visitedSet;
   }
 
-  // s에서 시작해 e로 끝나는 서브 그래프 노드 집합 반환
+  // s에서 시작해 e로 끝나는 서브 그래프 노드 집합 정렬해서 반환
   static llvm::SetVector<Operation *> getSubgraphNodes(
       Operation *s, Operation *e) {
     if (!s) {
-      llvm::outs() << "[getSubgraphNodes] s = nullptr \n";
+      llvm::outs() << "[getSubgraphNodes] fail: s = nullptr \n";
       return {};
     }
     if (!e) {
-      llvm::outs() << "[getSubgraphNodes] e = nullptr \n";
+      llvm::outs() << "[getSubgraphNodes] fail: e = nullptr \n";
       return {};
     }
 
@@ -386,7 +376,7 @@ private:
     llvm::DenseSet<Operation *> backwardSet = getBackwardReachableNodes(s, e);
 
     llvm::SetVector<Operation *> subgraphNodes;
-    for (mlir::Operation *op : forwardSet) {
+    for (Operation *op : forwardSet) {
       if (backwardSet.contains(op)) {
         subgraphNodes.insert(op);
       }
@@ -396,8 +386,10 @@ private:
   }
 
   // 서브그래프 고립성 검사
-  static IsolateStatus isIsolatedSubgraph(Operation *s, Operation *e) {
-    llvm::SetVector<Operation *> subgraphNodes = getSubgraphNodes(s, e);
+  static IsolateStatus checkIsolation(const subgraph &subgraph) {
+    llvm::SetVector<Operation *> subgraphNodes = subgraph.subgraphNodes;
+    const Operation *s = subgraph.getS();
+    const Operation *e = subgraph.getE();
 
     // I/O 검사
     for (Operation *op : subgraphNodes) {
@@ -414,17 +406,16 @@ private:
 
           if (!defOp) {
             // Case 1: BlockArgument (S가 아닌데 함수 인자를 받음)
-            llvm::outs()
-                << "[isIsolatedSubgraph] Failed: External input. Node ("
-                << op->getName() << ") is not S, but it receives "
-                << "a BlockArgument (" << operand << ") as input.\n";
+            llvm::outs() << "[checkIsolation] Failed: External input. Node ("
+                         << op->getName() << ") is not S, but it receives "
+                         << "a BlockArgument (" << operand << ") as input.\n";
             return IsolateStatus::NotSplittable;
           }
 
           if (!subgraphNodes.contains(defOp)) {
             // Case 2: Op Result (S 또는 서브그래프 내부 노드가 아닌 곳에서
             // 입력을 받음)
-            llvm::outs() << "[isIsolatedSubgraph] ExternalInput at ";
+            llvm::outs() << "[checkIsolation] ExternalInput at ";
             printOpOneLine(op);
             llvm::outs() << " <- ";
             printOpOneLine(defOp);
@@ -440,7 +431,7 @@ private:
           for (mlir::Operation *userOp : result.getUsers()) {
             // 서브그래프 외부(E가 아닌) 노드가 이 값을 사용함
             if (!subgraphNodes.contains(userOp)) {
-              llvm::outs() << "[isIsolatedSubgraph] ExternalOutput at ";
+              llvm::outs() << "[checkIsolation] ExternalOutput at ";
               printOpOneLine(op);
               llvm::outs() << " -> ";
               printOpOneLine(userOp);
@@ -456,6 +447,7 @@ private:
     return IsolateStatus::Isolated;
   }
 
+  // TODO: Refactor
   subgraph matchExpandShrinkPattern(
       Operation *peakOp, uint32_t detectionScope) {
     Operation *expander = nullptr;
@@ -468,7 +460,7 @@ private:
     IsolateStatus status = IsolateStatus::None;
 
     // [outs] 시작
-    llvm::outs() << "[match Expand/Shrink] start: peak=";
+    llvm::outs() << "[matchExpandShrinkPattern] start: peak=";
     printOpOneLine(peakOp);
     llvm::outs() << " scope=" << detectionScope << "\n";
 
@@ -497,10 +489,6 @@ private:
         } else
           detectionScope--;
 
-        llvm::outs() << "[bwd] pop ";
-        printOpOneLine(currentOp);
-        llvm::outs() << " scopeLeft=" << detectionScope << "\n";
-
         for (Value operand : currentOp->getOperands()) {
           if (Operation *defOp = operand.getDefiningOp()) {
             if (visited.insert(defOp).second)
@@ -511,7 +499,7 @@ private:
         if (checkTensorSizeChange(currentOp) == TensorSizeChange::EXPAND) {
           expander = currentOp;
           foundExpander = true;
-          llvm::outs() << "[bwd] EXPAND candidate: ";
+          llvm::outs() << "    [backwardSearch] EXPAND candidate: ";
           printOpOneLine(expander);
           llvm::outs() << "\n";
           break;
@@ -535,7 +523,7 @@ private:
         else
           detectionScope--;
 
-        llvm::outs() << "[fwd] pop ";
+        llvm::outs() << "    [forwardSearch] pop ";
         printOpOneLine(currentOp);
         llvm::outs() << " scopeLeft=" << detectionScope << "\n";
 
@@ -549,7 +537,7 @@ private:
         if (checkTensorSizeChange(currentOp) == TensorSizeChange::SHRINK) {
           shrinker = currentOp;
           foundShrinker = true;
-          llvm::outs() << "[fwd] SHRINK candidate: ";
+          llvm::outs() << "    [forwardSearch] SHRINK candidate: ";
           printOpOneLine(shrinker);
           llvm::outs() << "\n";
           break;
@@ -559,39 +547,43 @@ private:
 
     while (status != IsolateStatus::Isolated) {
       if (detectionScope == 0) {
-        llvm::outs() << "[match Expand/Shrink] scope exhausted\n";
+        llvm::outs() << "[matchExpandShrinkPattern] scope exhausted\n";
         return subgraph{};
       }
 
       if (status == IsolateStatus::None) {
         backwardSearch();
         forwardSearch();
-        status = isIsolatedSubgraph(expander, shrinker);
+
+        subgraph candidateSubgraph;
+        candidateSubgraph.subgraphNodes = getSubgraphNodes(expander, shrinker);
+
+        status = checkIsolation(subgraph(expander, shrinker));
       } else if (status == IsolateStatus::ExternalInput) {
-        llvm::outs() << "[match Expand/Shrink] status=" << toString(status)
+        llvm::outs() << "[matchExpandShrinkPattern] status=" << toString(status)
                      << " -> expand backward\n";
         backwardSearch();
-        status = isIsolatedSubgraph(expander, shrinker);
+        status = checkIsolation(subgraph(expander, shrinker));
       } else if (status == IsolateStatus::ExternalOutput) {
-        llvm::outs() << "[match Expand/Shrink] status=" << toString(status)
+        llvm::outs() << "[matchExpandShrinkPattern] status=" << toString(status)
                      << " -> expand forward\n";
         forwardSearch();
-        status = isIsolatedSubgraph(expander, shrinker);
+        status = checkIsolation(subgraph(expander, shrinker));
       } else if (status == IsolateStatus::NotSplittable) {
-        llvm::outs() << "[match Expand/Shrink] NotSplittable\n";
+        llvm::outs() << "[matchExpandShrinkPattern] NotSplittable\n";
         return subgraph{};
       }
-      llvm::outs() << "[match Expand/Shrink] status now=" << toString(status)
-                   << "\n";
+      llvm::outs() << "[matchExpandShrinkPattern] status now="
+                   << toString(status) << "\n";
     }
 
-    llvm::outs() << "[match Expand/Shrink] SPLITTABLE: S=";
+    llvm::outs() << "[matchExpandShrinkPattern] SPLITTABLE: S=";
     printOpOneLine(expander);
     llvm::outs() << "  E=";
     printOpOneLine(shrinker);
     llvm::outs() << "\n";
 
-    return subgraph{.subgraphNodes = getSubgraphNodes(expander, shrinker)};
+    return subgraph(expander, shrinker);
 
     // S~E까지 몇 개의 op를 split해야하며
     // 최적화로 얻는 이득은 얼마인지?(peak memory reduction)
@@ -916,7 +908,7 @@ private:
       llvm::outs() << '\n';
     }
 
-    IsolateStatus status = isIsolatedSubgraph(concatOp, shrinker);
+    IsolateStatus status = checkIsolation(subgraph(concatOp, shrinker));
 
     while (status != IsolateStatus::Isolated) {
       if (status == IsolateStatus::ExternalInput) {
@@ -927,7 +919,7 @@ private:
           llvm::outs() << "[match Merge/Shrink] found Concat Op: ";
           printOpOneLine(concatOp);
           llvm::outs() << '\n';
-          status = isIsolatedSubgraph(concatOp, shrinker);
+          status = checkIsolation(subgraph(concatOp, shrinker));
         }
       } else if (status == IsolateStatus::ExternalOutput) {
         if (!(shrinker = findShrinkerForward())) {
@@ -937,7 +929,7 @@ private:
           llvm::outs() << "[match Merge/Shrink] found Shrinker: ";
           printOpOneLine(shrinker);
           llvm::outs() << '\n';
-          status = isIsolatedSubgraph(concatOp, shrinker);
+          status = checkIsolation(subgraph(concatOp, shrinker));
         }
       } else if (status == IsolateStatus::NotSplittable) {
         llvm::outs() << "[match Merge/Shrink] status == NotSplittable \n";
@@ -945,7 +937,7 @@ private:
       }
     }
 
-    return subgraph{.subgraphNodes = getSubgraphNodes(concatOp, shrinker)};
+    return subgraph(concatOp, shrinker);
   }
 
   /*=========opimize logic=========*/
