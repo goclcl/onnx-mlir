@@ -7,6 +7,7 @@
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/Support/Casting.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include "mlir/Analysis/Liveness.h"
@@ -119,34 +120,40 @@ struct PeakMemOptPass
     /* ---------------Merge/Shrink--------------- */
 
     /* ===============Check Splittability=============== */
+    llvm::DenseSet<int64_t> exShSplittableDims;
+    /* expand/shrink pattern */
     if (expandShrinkSubgraph.getS()) {
-      llvm::DenseSet<int64_t> splittableDims =
-          getSplittableDims(expandShrinkSubgraph);
+      exShSplittableDims = getSplittableDims(expandShrinkSubgraph);
 
       llvm::outs() << "[Splittable Dims] ";
-      for (int64_t dim : splittableDims) {
+      for (int64_t dim : exShSplittableDims) {
         llvm::outs() << dim << ' ';
       }
       llvm::outs() << '\n';
     }
+
+    /* fork/join pattern */
     // if (forkJoinSubgraph.getS()) {
     //   // TODO:
     // }
-    if (auto s = mergeShrinkSubgraph.getS()) {
-      // TODO:
-      ONNXConcatOp concatOp = dyn_cast<ONNXConcatOp>(s);
-      int64_t splitDim = concatOp.getAxis();
-      if (!isDimPreserved(s, splitDim, mergeShrinkSubgraph)) {
-        llvm::outs()
-            << "[split Merge/Shrink] Concat dimension is not splittable.\n";
-      } else {
-        optConcat(mergeShrinkSubgraph);
-      }
-    }
+
+    /* merge/shrink pattern */
+    // if (auto s = mergeShrinkSubgraph.getS()) {
+    //   // TODO:
+    //   ONNXConcatOp concatOp = dyn_cast<ONNXConcatOp>(s);
+    //   int64_t splitDim = concatOp.getAxis();
+    //   if (!isDimPreserved(s, splitDim, mergeShrinkSubgraph)) {
+    //     llvm::outs()
+    //         << "[split Merge/Shrink] Concat dimension is not splittable.\n";
+    //   } else {
+    //     optConcat(mergeShrinkSubgraph);
+    //   }
+    // }
+
     /* ===============Check Splittability=============== */
 
     /* ===============Split=============== */
-    // splitSubgraph(expandShrinkSubgraph, 1);
+    splitSubgraph(expandShrinkSubgraph, *exShSplittableDims.begin());
     /* ===============Split=============== */
   }
 
@@ -1061,7 +1068,8 @@ private:
       }
     }
     // elementwise 연산일 경우
-    else if (isa<ONNXAddOp, ONNXClipOp, ONNXMulOp, ONNXSigmoidOp>(op)) {
+    else if (isa<ONNXAddOp, ONNXClipOp, ONNXMulOp, ONNXSigmoidOp, ONNXGeluOp>(
+                 op)) {
       if (op == e) {
         return true;
       }
@@ -1154,6 +1162,8 @@ private:
   static SmallVector<Value, 4> splitValue(OpBuilder &builder, Location loc,
       Value input, int64_t axis = 0, int64_t numOutputs = 2) {
     SmallVector<Value, 4> results;
+    OpBuilder::InsertionGuard guard(builder);
+    builder.setInsertionPointAfterValue(input);
 
     if (numOutputs <= 0) {
       llvm::outs() << "[splitValue] fail: numOutputs must be > 0.\n";
@@ -1222,14 +1232,14 @@ private:
     int64_t group = op.getGroup();
 
     // 2. 입력 채널 수 확인
-    auto inputType = dyn_cast<mlir::RankedTensorType>(op.getX().getType());
+    auto inputType = dyn_cast<RankedTensorType>(op.getX().getType());
     if (!inputType)
       return "Unknown (Unranked Input)";
 
     int64_t inputChannels = inputType.getShape()[1]; // NCHW 기준
 
     // 3. 커널 크기가 1x1인지 확인
-    auto weightType = dyn_cast<mlir::RankedTensorType>(op.getW().getType());
+    auto weightType = dyn_cast<RankedTensorType>(op.getW().getType());
     if (!weightType)
       return "Unknown (Unranked Weight)";
 
@@ -1341,7 +1351,6 @@ private:
       auto unrankedOutTy = UnrankedTensorType::get(elemTy);
 
       // int64_t outRank = std::max(rankA, rankB);
-
       auto makeMatMul = [&](Value lhs, Value rhs) -> Value {
         auto mm = builder.create<ONNXMatMulOp>(loc, unrankedOutTy, lhs, rhs);
         return mm.getResult();
@@ -1352,6 +1361,7 @@ private:
         auto aSplits = splitValue(builder, loc, A, axisA);
         auto A1 = aSplits[0];
         auto A2 = aSplits[1];
+
         Y1 = makeMatMul(A1, B);
         Y2 = makeMatMul(A2, B);
       } else if (splitDim == 2) {
@@ -1359,6 +1369,7 @@ private:
         auto bSplits = splitValue(builder, loc, B, axisB);
         auto B1 = bSplits[0];
         auto B2 = bSplits[1];
+
         Y1 = makeMatMul(A, B1);
         Y2 = makeMatMul(A, B2);
       } else {
@@ -1382,8 +1393,6 @@ private:
       // convOp일 경우
       if (auto convOp = dyn_cast<ONNXConvOp>(clonedOp)) {
         if (splitDim == 1) {
-          // insertion point
-          builder.setInsertionPoint(convOp);
           // weight 교체
           Value w = convOp.getW();
           auto wSplits = splitValue(builder, convOp.getLoc(), w, 0);
@@ -1403,8 +1412,9 @@ private:
               si64Ty, dyn_cast<TensorType>(w1.getType()).getShape()[0]);
           convOp.setGroupAttr(newGroupAttr);
         }
-        // reshapeOp일 경우
-      } else if (auto reshapeOp = dyn_cast<ONNXReshapeOp>(clonedOp)) {
+      }
+      // reshapeOp일 경우
+      else if (auto reshapeOp = dyn_cast<ONNXReshapeOp>(clonedOp)) {
         Value shapeVal = reshapeOp.getShape();
         auto constOp = dyn_cast<ONNXConstantOp>(shapeVal.getDefiningOp());
         if (!constOp) {
@@ -1442,19 +1452,62 @@ private:
         reshapeOp.setOperand(1, newConstVal);
 
       }
-      // elementwise 연산일 경우 operand가 constant라면 split
+      // Binary Element-wise 연산일 경우
       else if (isa<ONNXAddOp, ONNXMulOp>(clonedOp)) {
+        int64_t constRank, actRank;
+        Value constVal;
+
+        // 원본 op의 각 operand에 대해
+        for (Value v : op->getOperands()) {
+          Operation *defOp = v.getDefiningOp();
+          auto rtt = dyn_cast<RankedTensorType>(v.getType());
+
+          if (!rtt) {
+            llvm::outs()
+                << "[splitSubgraph] fail: Non-ranked operand encountered.\n";
+            llvm::outs() << "    In Op: \n    ";
+            printOpOneLine(op);
+            llvm::outs() << "\n    Defining Op: \n    ";
+            printOpOneLine(defOp);
+            llvm::outs() << "\n";
+          }
+
+          // operand가 Constant일때
+          if (isa<ONNXConstantOp>(defOp)) {
+            constRank = rtt.getRank();
+            constVal = v;
+          }
+          // operand가 activation 일때
+          else {
+            actRank = rtt.getRank();
+          }
+        }
+        // Constant Splitting
         uint64_t idx = 0;
+        int64_t constSplitDim = splitDim - (actRank - constRank);
+
+        auto rtt = dyn_cast<RankedTensorType>(constVal.getType());
+        int64_t splitDimSize = rtt.getDimSize(constSplitDim);
+
+        // clonedOp의 각 operand에 대해
         for (Value v : clonedOp->getOperands()) {
           Operation *defOp = v.getDefiningOp();
-          if (isa<ONNXConstantOp>(defOp)) {
-            auto xSplits = splitValue(builder, loc, v, splitDim);
+
+          // operand가 constant이고 splitDimSzie > 1 일때만 constant를 splitting
+          // splitDimSize == 1 이면 broadcasting되는 차원이므로 split할 필요가
+          // 없음
+          if (isa<ONNXConstantOp>(defOp) && splitDimSize > 1) {
+            int64_t constSplitDim = splitDim - (actRank - constRank);
+
+            auto xSplits = splitValue(builder, loc, v, constSplitDim);
             auto x1 = xSplits[0];
             clonedOp->setOperand(idx, x1);
           }
           idx++;
         }
-      } else if (isa<ONNXClipOp, ONNXSigmoidOp>(clonedOp)) {
+      }
+      // Unary Element-wise 연산일 경우
+      else if (isa<ONNXClipOp, ONNXSigmoidOp, ONNXGeluOp>(clonedOp)) {
         ;
       }
 
@@ -1541,19 +1594,62 @@ private:
         reshapeOp.setOperand(1, newConstVal);
 
       }
-      // elementwise 연산일 경우 operand가 constant라면 split
+      // Binary Element-wise Op
       else if (isa<ONNXAddOp, ONNXMulOp>(clonedOp)) {
+        int64_t constRank, actRank;
+        Value constVal;
+
+        // 원본 op의 각 operand에 대해
+        for (Value v : op->getOperands()) {
+          Operation *defOp = v.getDefiningOp();
+          auto rtt = dyn_cast<RankedTensorType>(v.getType());
+
+          if (!rtt) {
+            llvm::outs()
+                << "[splitSubgraph] fail: Non-ranked operand encountered.\n";
+            llvm::outs() << "    In Op: \n    ";
+            printOpOneLine(op);
+            llvm::outs() << "\n    Defining Op: \n    ";
+            printOpOneLine(defOp);
+            llvm::outs() << "\n";
+          }
+
+          // operand가 Constant일때
+          if (isa<ONNXConstantOp>(defOp)) {
+            constRank = rtt.getRank();
+            constVal = v;
+          }
+          // operand가 activation 일때
+          else {
+            actRank = rtt.getRank();
+          }
+        }
+        // Constant Splitting
         uint64_t idx = 0;
+        int64_t constSplitDim = splitDim - (actRank - constRank);
+
+        auto rtt = dyn_cast<RankedTensorType>(constVal.getType());
+        int64_t splitDimSize = rtt.getDimSize(constSplitDim);
+
+        // clonedOp의 각 operand에 대해
         for (Value v : clonedOp->getOperands()) {
           Operation *defOp = v.getDefiningOp();
-          if (isa<ONNXConstantOp>(defOp)) {
-            auto xSplits = splitValue(builder, loc, v, splitDim);
-            auto x1 = xSplits[2];
-            clonedOp->setOperand(idx, x1);
+
+          // operand가 constant이고 splitDimSzie > 1 일때만 constant를 splitting
+          // splitDimSize == 1 이면 broadcasting되는 차원이므로 split할 필요가
+          // 없음
+          if (isa<ONNXConstantOp>(defOp) && splitDimSize > 1) {
+            int64_t constSplitDim = splitDim - (actRank - constRank);
+
+            auto xSplits = splitValue(builder, loc, v, constSplitDim);
+            auto x2 = xSplits[1];
+            clonedOp->setOperand(idx, x2);
           }
           idx++;
         }
-      } else if (isa<ONNXClipOp, ONNXSigmoidOp>(clonedOp)) {
+      }
+      // Unary Element-wise Op
+      else if (isa<ONNXClipOp, ONNXSigmoidOp, ONNXGeluOp>(clonedOp)) {
         ;
       }
       // 결과 타입 수정
@@ -1611,6 +1707,8 @@ private:
     //   op->erase();
     // }
     /*------------기존 연산 지우기------------*/
+
+    llvm::outs() << "[splitSubgraph] Successfully optimized.\n";
   }
 
   void optConcat(subgraph mergeShrinkSubgraph) {
