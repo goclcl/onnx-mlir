@@ -1283,6 +1283,9 @@ private:
     llvm::outs() << "[splitSubgraph] Splitting subgraph at dimension "
                  << splitDim << "\n";
 
+    enum class MergeKind { Concat, Add };
+    MergeKind mergeKind = MergeKind::Concat;
+
     Operation *s = subgraph.getS();
     Operation *e = subgraph.getE();
     OpBuilder builder(s);
@@ -1369,6 +1372,8 @@ private:
         Operation *clonedOp = builder.clone(*op, mapping);
 
         // 2-1. ConvOp 처리
+        // TODO:
+        // splitDim이 reduction일 경우 mergeKind = MergeKind::Add로 바꿔주기
         if (auto convOp = dyn_cast<ONNXConvOp>(clonedOp)) {
           if (splitDim == 1) {
             // Weight & Bias Splitting
@@ -1390,7 +1395,49 @@ private:
             convOp.setGroupAttr(newGroupAttr);
           }
         }
-        // 2-2. ReshapeOp 처리
+
+        // 2-2. MatmulOp 처리
+        else if (auto matmulOp = dyn_cast<ONNXMatMulOp>(clonedOp)) {
+          // 원본 op에서 타입 정보 가져오기 (clonedOp는 이미 Unranked로 변경됨)
+          auto origMatmulOp = dyn_cast<ONNXMatMulOp>(op);
+          Value origB = origMatmulOp.getB();
+          auto bTy = dyn_cast<RankedTensorType>(origB.getType());
+
+          // clonedOp에서 현재 operand 가져오기
+          Value B = matmulOp.getB();
+          Operation *bDefOp = B.getDefiningOp();
+          bool bIsConst = bDefOp && isa<ONNXConstantOp>(bDefOp);
+
+          // splitDim은 현재 연산으로 들어오는 activation의 split dimension을
+          // 의미함. matmul에서 가능한 경우는
+          // activation X weight, activation X activation
+          // 두 가지인것으로 보여짐. 따라서 A는 일단 activation이라고 가정하자.
+          if (splitDim == 1) {
+            // splitDim == 1: A의 마지막에서 두 번째 차원(M)으로 분할
+            // A는 mapping으로 이미 분할된 값이 들어올거고 B는 분할 할 필요 없음
+          } else if (splitDim == 2) {
+            // splitDim == 2: A의 마지막 차원(K)으로 분할
+            // ** op == e인 경우에만 여기 들어올 수 있음
+
+            // e에서 splitDim이 reduction되는 차원이므로 마지막에 Add로
+            // merge해야함.
+            mergeKind = MergeKind::Add;
+
+            // B가 상수(weight)인 경우 분할 필요
+            if (bIsConst) {
+              int64_t splitAxis = bTy.getRank() - 2;
+              auto bSplit =
+                  splitValue(builder, matmulOp.getLoc(), B, splitAxis)[pathIdx];
+              matmulOp.setOperand(1, bSplit);
+            }
+            // B가 변수라면 이미 mapping을 통해 분할된 값이 전달됨
+          } else {
+            llvm::outs() << "[splitSubgraph] Warning: Unsupported splitDim for "
+                            "MatMul in path.\n";
+          }
+        }
+
+        // 2-3. ReshapeOp 처리
         else if (auto reshapeOp = dyn_cast<ONNXReshapeOp>(clonedOp)) {
           Value shapeVal = reshapeOp.getShape();
           if (auto constOp =
@@ -1417,7 +1464,7 @@ private:
             }
           }
         }
-        // 2-3. Binary Element-wise (Add, Mul) 처리
+        // 2-4. Binary Element-wise (Add, Mul) 처리
         else if (isa<ONNXAddOp, ONNXMulOp>(clonedOp)) {
           int64_t constRank, actRank;
           Value constVal;
@@ -1464,6 +1511,9 @@ private:
           }
         }
 
+        // Unary Element-wise는 아무것도 안해줘도 됨
+        // ex. clip, gelu, sigmoid
+
         // 결과 타입 갱신 (Unranked로 변경하여 추후 Shape Inference 유도)
         Value y = clonedOp->getResult(0);
         y.setType(UnrankedTensorType::get(
@@ -1476,7 +1526,9 @@ private:
       return mapping.lookup(e->getResult(0));
     };
 
-    /* 3. Execute Paths & Concat                                */
+    /*==========================================================*/
+    /* 3. Execute Paths & Merge (Concat or Add)                 */
+    /*==========================================================*/
 
     // Path A 생성
     Value outA = processPath(Y1, 0);
@@ -1484,22 +1536,34 @@ private:
     // Path B 생성
     Value outB = processPath(Y2, 1);
 
-    // Concat
-    builder.setInsertionPoint(
-        s); // Insert Concat at the original start position (or use after outB)
-    builder.setInsertionPointAfterValue(outB); // 보통 마지막 연산 뒤에 붙임
+    // Insertion Point 설정 (마지막 연산 뒤)
+    builder.setInsertionPointAfterValue(outB);
 
+    // 공통적으로 사용할 타입 정의
     auto elemTy = dyn_cast<TensorType>(outA.getType()).getElementType();
     auto unrankedOutTy = UnrankedTensorType::get(elemTy);
-    IntegerAttr concatAxisAttr =
-        builder.getIntegerAttr(builder.getIntegerType(64, true), splitDim);
 
-    auto concatOp = builder.create<ONNXConcatOp>(
-        s->getLoc(), unrankedOutTy, ValueRange{outA, outB}, concatAxisAttr);
+    Value mergedResult;
+
+    if (mergeKind == MergeKind::Concat) {
+      IntegerAttr concatAxisAttr =
+          builder.getIntegerAttr(builder.getIntegerType(64, true), splitDim);
+
+      auto concatOp = builder.create<ONNXConcatOp>(
+          s->getLoc(), unrankedOutTy, ValueRange{outA, outB}, concatAxisAttr);
+
+      mergedResult = concatOp.getResult();
+
+    } else if (mergeKind == MergeKind::Add) {
+      auto addOp =
+          builder.create<ONNXAddOp>(s->getLoc(), unrankedOutTy, outA, outB);
+
+      mergedResult = addOp.getResult();
+    }
 
     // 결과 교체
     if (e->getNumResults() == 1) {
-      e->getResult(0).replaceAllUsesWith(concatOp.getResult());
+      e->getResult(0).replaceAllUsesWith(mergedResult);
     }
 
     /*==========================================================*/
