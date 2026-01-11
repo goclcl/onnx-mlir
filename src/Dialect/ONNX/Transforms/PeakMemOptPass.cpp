@@ -7,7 +7,6 @@
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
-#include "llvm/Support/Casting.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include "mlir/Analysis/Liveness.h"
@@ -51,7 +50,7 @@ struct PeakMemOptPass
     /* ===============Peak 탐색=============== */
     llvm::outs()
         << "\n================ 1. Search for Peak Operation ================\n";
-    Operation *peakOp = nullptr;
+    llvm::SmallVector<Operation *, 8> peakOps;
     int64_t peakBytes = -1;
     funcOp.walk([&](Operation *op) {
       // onnx.Constant와 func.func op는 스킵
@@ -61,104 +60,136 @@ struct PeakMemOptPass
       int64_t liveTensorsSize = getLiveTensorsSize(op, liveness);
 
       if (liveTensorsSize > peakBytes) {
+        peakOps.clear();
         peakBytes = liveTensorsSize;
-        peakOp = op;
+        peakOps.push_back(op);
+      } else if (liveTensorsSize == peakBytes) {
+        peakOps.push_back(op);
       }
     });
 
-    llvm::outs() << "[peak]" << peakBytes << "B at ";
-    printOpOneLine(peakOp);
-    llvm::outs() << "\n";
+    // 앞선 op(Add)가 뒤의 op(Gelu)의 입력이 되는 관계라면, 뒤의 op는 최적화
+    // 대상에서 제외
+    llvm::SmallPtrSet<Operation *, 8> opsToSkip;
+    llvm::SmallVector<Operation *, 8> finalTargets;
+
+    // peakOps는 이미 walk 순서대로 정렬되어 있음
+    for (Operation *op : peakOps) {
+      // 스킵하기로 결정된 연산이면 패스
+      if (opsToSkip.contains(op))
+        continue;
+
+      finalTargets.push_back(op);
+
+      // 현재 op의 결과값들이 어디에 쓰이는지 확인 (Users 확인)
+      for (Value result : op->getResults()) {
+        for (Operation *userOp : result.getUsers()) {
+          // 현재 op의 결과값을 쓰는 userOp는 스킵 목록에 추가
+          opsToSkip.insert(userOp);
+        }
+      }
+    }
+
+    llvm::outs() << "[peak]" << peakBytes << "B at \n";
+    for (Operation *peakOp : finalTargets) {
+      llvm::outs() << "    ";
+      printOpOneLine(peakOp);
+      llvm::outs() << "\n";
+    }
 
     /* ===============Optimizable Patterns 탐색=============== */
     llvm::outs() << "\n================ 2. Detect Optimizable Patterns "
                     "================\n";
 
-    /* ---------------Expand/Shrink--------------- */
-    const uint32_t DETECTION_SCOPE = 64;
+    for (Operation *peakOp : finalTargets) {
 
-    subgraph expandShrinkSubgraph =
-        matchExpandShrinkPattern(peakOp, DETECTION_SCOPE);
+      /* ---------------Expand/Shrink--------------- */
+      const uint32_t DETECTION_SCOPE = 64;
 
-    if (!expandShrinkSubgraph.getS()) {
-      llvm::outs() << "[detect Expand/Shrink] no matched pattern\n";
-    } else {
-      llvm::outs() << "[detect Expand/Shrink] splittable subgraph: S=";
-      printOpOneLine(expandShrinkSubgraph.getS());
-      llvm::outs() << "  E=";
-      printOpOneLine(expandShrinkSubgraph.getE());
-      llvm::outs() << "\n";
-    }
-    /* ---------------Expand/Shrink--------------- */
+      subgraph expandShrinkSubgraph =
+          matchExpandShrinkPattern(peakOp, DETECTION_SCOPE);
 
-    /* ---------------Fork/Join--------------- */
-    IsolatedSubgraph isolatedSubgraph;
-
-    if (matchForkJoinPattern(peakOp, funcOp, isolatedSubgraph)) {
-      llvm::outs() << "[detect Fork/Merge] splittable subgraph: S=";
-      printOpOneLine(isolatedSubgraph.entryGate);
-      llvm::outs() << "  E=";
-      printOpOneLine(isolatedSubgraph.exitGate);
-      llvm::outs() << "\n";
-    } else {
-      llvm::outs() << "[detect Fork/Merge] no matched pattern\n";
-    }
-    /* ---------------Fork/Join--------------- */
-
-    /* ---------------Merge/Shrink--------------- */
-    subgraph mergeShrinkSubgraph = matchMergeShrinkPattern(peakOp);
-
-    if (mergeShrinkSubgraph.getS()) {
-      llvm::outs() << "[detect Merge/Shrink] splittable subgraph: S=";
-      printOpOneLine(mergeShrinkSubgraph.getS());
-      llvm::outs() << "  E=";
-      printOpOneLine(mergeShrinkSubgraph.getE());
-      llvm::outs() << "\n";
-    } else {
-      llvm::outs() << "[detect Merge/Shrink] no matched pattern\n";
-    }
-    /* ---------------Merge/Shrink--------------- */
-
-    /* ===============Check Splittability=============== */
-    llvm::DenseSet<int64_t> exShSplittableDims;
-    /* expand/shrink pattern */
-    if (expandShrinkSubgraph.getS()) {
-      exShSplittableDims = getSplittableDims(expandShrinkSubgraph);
-
-      llvm::outs() << "[Splittable Dims] ";
-      for (int64_t dim : exShSplittableDims) {
-        llvm::outs() << dim << ' ';
+      if (!expandShrinkSubgraph.getS()) {
+        llvm::outs() << "[detect Expand/Shrink] no matched pattern\n";
+      } else {
+        llvm::outs() << "[detect Expand/Shrink] splittable subgraph: S=";
+        printOpOneLine(expandShrinkSubgraph.getS());
+        llvm::outs() << "  E=";
+        printOpOneLine(expandShrinkSubgraph.getE());
+        llvm::outs() << "\n";
       }
-      llvm::outs() << '\n';
+      /* ---------------Expand/Shrink--------------- */
+
+      /* ---------------Fork/Join--------------- */
+      IsolatedSubgraph isolatedSubgraph;
+
+      if (matchForkJoinPattern(peakOp, funcOp, isolatedSubgraph)) {
+        llvm::outs() << "[detect Fork/Merge] splittable subgraph: S=";
+        printOpOneLine(isolatedSubgraph.entryGate);
+        llvm::outs() << "  E=";
+        printOpOneLine(isolatedSubgraph.exitGate);
+        llvm::outs() << "\n";
+      } else {
+        llvm::outs() << "[detect Fork/Merge] no matched pattern\n";
+      }
+      /* ---------------Fork/Join--------------- */
+
+      /* ---------------Merge/Shrink--------------- */
+      subgraph mergeShrinkSubgraph = matchMergeShrinkPattern(peakOp);
+
+      if (mergeShrinkSubgraph.getS()) {
+        llvm::outs() << "[detect Merge/Shrink] splittable subgraph: S=";
+        printOpOneLine(mergeShrinkSubgraph.getS());
+        llvm::outs() << "  E=";
+        printOpOneLine(mergeShrinkSubgraph.getE());
+        llvm::outs() << "\n";
+      } else {
+        llvm::outs() << "[detect Merge/Shrink] no matched pattern\n";
+      }
+      /* ---------------Merge/Shrink--------------- */
+
+      /* ===============Check Splittability=============== */
+      llvm::DenseSet<int64_t> exShSplittableDims;
+      /* expand/shrink pattern */
+      if (expandShrinkSubgraph.getS()) {
+        exShSplittableDims = getSplittableDims(expandShrinkSubgraph);
+
+        llvm::outs() << "[Splittable Dims] ";
+        for (int64_t dim : exShSplittableDims) {
+          llvm::outs() << dim << ' ';
+        }
+        llvm::outs() << '\n';
+      }
+
+      /* fork/join pattern */
+      // if (forkJoinSubgraph.getS()) {
+      //   // TODO:
+      // }
+
+      /* merge/shrink pattern */
+      // if (auto s = mergeShrinkSubgraph.getS()) {
+      //   // TODO:
+      //   ONNXConcatOp concatOp = dyn_cast<ONNXConcatOp>(s);
+      //   int64_t splitDim = concatOp.getAxis();
+      //   if (!isDimPreserved(s, splitDim, mergeShrinkSubgraph)) {
+      //     llvm::outs()
+      //         << "[split Merge/Shrink] Concat dimension is not
+      //         splittable.\n";
+      //   } else {
+      //     optConcat(mergeShrinkSubgraph);
+      //   }
+      // }
+
+      /* ===============Check Splittability=============== */
+
+      /* ===============Split=============== */
+      splitSubgraph(expandShrinkSubgraph, *exShSplittableDims.begin());
+      /* ===============Split=============== */
     }
-
-    /* fork/join pattern */
-    // if (forkJoinSubgraph.getS()) {
-    //   // TODO:
-    // }
-
-    /* merge/shrink pattern */
-    // if (auto s = mergeShrinkSubgraph.getS()) {
-    //   // TODO:
-    //   ONNXConcatOp concatOp = dyn_cast<ONNXConcatOp>(s);
-    //   int64_t splitDim = concatOp.getAxis();
-    //   if (!isDimPreserved(s, splitDim, mergeShrinkSubgraph)) {
-    //     llvm::outs()
-    //         << "[split Merge/Shrink] Concat dimension is not splittable.\n";
-    //   } else {
-    //     optConcat(mergeShrinkSubgraph);
-    //   }
-    // }
-
-    /* ===============Check Splittability=============== */
-
-    /* ===============Split=============== */
-    splitSubgraph(expandShrinkSubgraph, *exShSplittableDims.begin());
-    /* ===============Split=============== */
   }
 
 private:
-  // 텐서 크기 변화 상태를 나타내는 열거형
+  // 텐서 크기 변화 상태
   enum class TensorSizeChange {
     EXPAND, // 크기가 커짐
     SHRINK, // 크기가 작아짐
