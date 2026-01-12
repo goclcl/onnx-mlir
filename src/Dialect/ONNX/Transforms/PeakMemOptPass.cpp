@@ -51,6 +51,8 @@ struct PeakMemOptPass
     llvm::outs()
         << "\n================ 1. Search for Peak Operation ================\n";
     llvm::SmallVector<Operation *, 8> peakOps;
+    // 최적화 대상에서 제외할 ops
+    DenseSet<Operation *> coveredOps;
     int64_t peakBytes = -1;
     funcOp.walk([&](Operation *op) {
       // onnx.Constant와 func.func op는 스킵
@@ -68,40 +70,21 @@ struct PeakMemOptPass
       }
     });
 
-    // 앞선 op(Add)가 뒤의 op(Gelu)의 입력이 되는 관계라면, 뒤의 op는 최적화
-    // 대상에서 제외
-    llvm::SmallPtrSet<Operation *, 8> opsToSkip;
-    llvm::SmallVector<Operation *, 8> finalTargets;
-
-    // peakOps는 이미 walk 순서대로 정렬되어 있음
-    for (Operation *op : peakOps) {
-      // 스킵하기로 결정된 연산이면 패스
-      if (opsToSkip.contains(op))
-        continue;
-
-      finalTargets.push_back(op);
-
-      // 현재 op의 결과값들이 어디에 쓰이는지 확인 (Users 확인)
-      for (Value result : op->getResults()) {
-        for (Operation *userOp : result.getUsers()) {
-          // 현재 op의 결과값을 쓰는 userOp는 스킵 목록에 추가
-          opsToSkip.insert(userOp);
-        }
-      }
-    }
-
     llvm::outs() << "[peak]" << peakBytes << "B at \n";
-    for (Operation *peakOp : finalTargets) {
+    for (Operation *peakOp : peakOps) {
       llvm::outs() << "    ";
       printOpOneLine(peakOp);
       llvm::outs() << "\n";
     }
 
-    /* ===============Optimizable Patterns 탐색=============== */
-    llvm::outs() << "\n================ 2. Detect Optimizable Patterns "
-                    "================\n";
-
-    for (Operation *peakOp : finalTargets) {
+    for (Operation *peakOp : peakOps) {
+      // 중복 처리 방지
+      if (coveredOps.contains(peakOp)) {
+        continue;
+      }
+      /* ===============Optimizable Patterns 탐색=============== */
+      llvm::outs() << "\n================ 2. Detect Optimizable Patterns "
+                      "================\n";
 
       /* ---------------Expand/Shrink--------------- */
       const uint32_t DETECTION_SCOPE = 64;
@@ -183,7 +166,13 @@ struct PeakMemOptPass
       /* ===============Check Splittability=============== */
 
       /* ===============Split=============== */
-      splitSubgraph(expandShrinkSubgraph, *exShSplittableDims.begin());
+      // splitSubgraph(expandShrinkSubgraph, *exShSplittableDims.begin());
+      splitSubgraph(expandShrinkSubgraph, 1);
+
+      // 중복 처리를 피하기 위해 최적화된 ops는 coverdOps에 추가
+      auto nodes = expandShrinkSubgraph.subgraphNodes;
+      coveredOps.reserve(coveredOps.size() + nodes.size());
+      coveredOps.insert(nodes.begin(), nodes.end());
       /* ===============Split=============== */
     }
   }
@@ -1203,8 +1192,6 @@ private:
 
     if (!input || isa<NoneType>(input.getType())) {
       Value none = builder.create<ONNXNoneOp>(loc).getResult();
-      // 요청 개수만큼 none 채워서 리턴해도 되고,
-      // 지금은 그냥 비어 있는 results 리턴함.
       for (int64_t i = 0; i < numOutputs; ++i)
         results.push_back(none);
       return results;
@@ -1219,25 +1206,27 @@ private:
 
     auto shape = inputType.getShape();
     auto elementTy = inputType.getElementType();
-
     int64_t totalSize = shape[axis];
 
-    // ONNX Split에서 equal split을 쓰려면 나누어 떨어져야 함.
-    if (totalSize % numOutputs != 0) {
-      llvm::outs() << "[splitValue] fail: totalSize(" << totalSize
-                   << ") is not divisible by numOutputs(" << numOutputs
-                   << ").\n";
-      return results;
+    // 1. 각 분할의 크기 계산
+    int64_t baseSize = totalSize / numOutputs;
+    int64_t remainder = totalSize % numOutputs;
+
+    SmallVector<int64_t, 4> splitSizes;
+    splitSizes.reserve(numOutputs);
+
+    // 나머지를 앞쪽 인덱스에 1씩 나누어 줌 (예: 10/3 -> 4, 3, 3)
+    for (int64_t i = 0; i < numOutputs; ++i) {
+      int64_t size = baseSize + (i < remainder ? 1 : 0);
+      splitSizes.push_back(size);
     }
 
-    int64_t chunkSize = totalSize / numOutputs;
-
-    // 각 output의 타입 계산
+    // 2. 각 output의 타입(Shape) 계산
     SmallVector<Type, 4> outTypes;
     outTypes.reserve(numOutputs);
-    for (int64_t i = 0; i < numOutputs; ++i) {
+    for (int64_t size : splitSizes) {
       SmallVector<int64_t, 4> outShape(shape.begin(), shape.end());
-      outShape[axis] = chunkSize;
+      outShape[axis] = size;
       outTypes.push_back(RankedTensorType::get(outShape, elementTy));
     }
 
@@ -1247,10 +1236,26 @@ private:
     auto numOutputsAttr = builder.getIntegerAttr(
         builder.getIntegerType(64, /*isSigned=*/true), numOutputs);
 
-    auto splitOp = builder.create<ONNXSplitOp>(
-        loc, TypeRange(outTypes), input, noneVal, axisAttr, numOutputsAttr);
+    // 3. 'split' 입력 값 생성 (균등 분할이 아닌 경우 필수)
+    Value splitVal = noneVal;
+    if (remainder != 0) {
+      // split 정보를 담은 Constant Op 생성 (1D Tensor)
+      auto splitType =
+          RankedTensorType::get({numOutputs}, builder.getI64Type());
+      auto splitAttr =
+          DenseElementsAttr::get(splitType, llvm::ArrayRef(splitSizes));
 
-    // 결과 value들 모아서 리턴
+      // ONNXConstantOp 생성 (value attribute에 값 할당)
+      splitVal = builder.create<ONNXConstantOp>(loc, Attribute(), splitAttr)
+                     .getResult();
+    }
+
+    // 4. ONNXSplitOp 생성
+    // splitVal이 None이면 균등 분할, 아니면 splitVal에 명시된
+    // 대로 분할
+    auto splitOp = builder.create<ONNXSplitOp>(
+        loc, TypeRange(outTypes), input, splitVal, axisAttr, numOutputsAttr);
+
     for (int64_t i = 0; i < numOutputs; ++i)
       results.push_back(splitOp.getResult(i));
 
@@ -1521,16 +1526,15 @@ private:
           int64_t constSplitDim = splitDim - (actRank - constRank);
 
           auto rtt = dyn_cast<RankedTensorType>(constVal.getType());
-          int64_t splitDimSize = rtt.getDimSize(constSplitDim);
 
           // clonedOp의 operand를 순회하여 constant를 찾아 분할
           for (Value v : clonedOp->getOperands()) {
             Operation *defOp = v.getDefiningOp();
             // Constant이면서 Broadcasting이 아닌 경우(splitDimSize > 1)에만
             // 분할
-            if (isa<ONNXConstantOp>(defOp) && splitDimSize > 1) {
-              int64_t constSplitDim = splitDim - (actRank - constRank);
-              if (constSplitDim >= 0) {
+            if (isa<ONNXConstantOp>(defOp) && constSplitDim > -1) {
+              int64_t splitDimSize = rtt.getDimSize(constSplitDim);
+              if (splitDimSize > 1) {
                 auto splitVal =
                     splitValue(builder, loc, v, constSplitDim)[pathIdx];
                 clonedOp->setOperand(operandIdx, splitVal);
