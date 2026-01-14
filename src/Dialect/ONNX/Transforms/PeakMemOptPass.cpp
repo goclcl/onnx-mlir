@@ -1369,6 +1369,8 @@ private:
       Value B = matmulOp.getB();
       auto aTy = dyn_cast<RankedTensorType>(A.getType());
       auto bTy = dyn_cast<RankedTensorType>(B.getType());
+      auto sOutRank =
+          dyn_cast<RankedTensorType>(matmulOp.getY().getType()).getRank();
       auto unrankedOutTy = UnrankedTensorType::get(aTy.getElementType());
 
       auto makeMatMul = [&](Value lhs, Value rhs) -> Value {
@@ -1376,19 +1378,25 @@ private:
             .getResult();
       };
 
-      if (splitDim == 1) {
+      // (S출력의 rank - splitDim > 2) -> splitDim이 broadcasting되는 차원임
+      if (sOutRank - splitDim > 2) {
+        auto aSplits = splitValue(builder, loc, A, splitDim);
+        Y1 = makeMatMul(aSplits[0], B);
+        Y2 = makeMatMul(aSplits[1], B);
+      }
+      // splitDim이 MxK @ KxN 에서 M일때
+      else if (sOutRank - splitDim == 2) {
         auto aSplits = splitValue(builder, loc, A, aTy.getRank() - 2);
         Y1 = makeMatMul(aSplits[0], B);
         Y2 = makeMatMul(aSplits[1], B);
-      } else if (splitDim == 2) {
+      }
+      // splitDim이 MxK @ KxN 에서 N일때
+      else if (sOutRank - splitDim == 1) {
         auto bSplits = splitValue(builder, loc, B, bTy.getRank() - 1);
         Y1 = makeMatMul(A, bSplits[0]);
         Y2 = makeMatMul(A, bSplits[1]);
-      } else {
-        llvm::outs()
-            << "[splitSubgraph] fail: Unsupported dimension for MatMul.\n";
-        return;
       }
+
     } else {
       llvm::outs() << "[splitSubgraph] fail: Unknown Operation at S.\n";
       return;
