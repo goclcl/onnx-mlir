@@ -7,6 +7,7 @@
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/Support/Casting.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include "mlir/Analysis/Liveness.h"
@@ -106,14 +107,16 @@ struct PeakMemOptPass
       /* ---------------Fork/Join--------------- */
       IsolatedSubgraph isolatedSubgraph;
 
-      if (matchForkJoinPattern(peakOp, funcOp, isolatedSubgraph)) {
-        llvm::outs() << "[detect Fork/Merge] splittable subgraph: S=";
-        printOpOneLine(isolatedSubgraph.entryGate);
-        llvm::outs() << "  E=";
-        printOpOneLine(isolatedSubgraph.exitGate);
-        llvm::outs() << "\n";
+      subgraph forkJoinSubgraph = matchForkJoinPattern(peakOp);
+
+      if (!forkJoinSubgraph.getS()) {
+        llvm::outs() << "[detect Fork-Join] no matched pattern\n";
       } else {
-        llvm::outs() << "[detect Fork/Merge] no matched pattern\n";
+        llvm::outs() << "[detect Fork-Join] splittable subgraph: S=";
+        printOpOneLine(forkJoinSubgraph.getS());
+        llvm::outs() << "  E=";
+        printOpOneLine(forkJoinSubgraph.getE());
+        llvm::outs() << "\n";
       }
       /* ---------------Fork/Join--------------- */
 
@@ -136,12 +139,6 @@ struct PeakMemOptPass
       /* expand/shrink pattern */
       if (expandShrinkSubgraph.getS()) {
         exShSplittableDims = getSplittableDims(expandShrinkSubgraph);
-
-        llvm::outs() << "[Splittable Dims] ";
-        for (int64_t dim : exShSplittableDims) {
-          llvm::outs() << dim << ' ';
-        }
-        llvm::outs() << '\n';
       }
 
       /* fork/join pattern */
@@ -474,7 +471,6 @@ private:
     return IsolateStatus::Isolated;
   }
 
-  // TODO: Refactor
   subgraph matchExpandShrinkPattern(
       Operation *peakOp, uint32_t detectionScope) {
     Operation *expander = nullptr;
@@ -582,10 +578,8 @@ private:
         backwardSearch();
         forwardSearch();
 
-        subgraph candidateSubgraph;
-        candidateSubgraph.subgraphNodes = getSubgraphNodes(expander, shrinker);
-
-        status = checkIsolation(subgraph(expander, shrinker));
+        subgraph candidateSubgraph = subgraph(expander, shrinker);
+        status = checkIsolation(candidateSubgraph);
       } else if (status == IsolateStatus::ExternalInput) {
         llvm::outs() << "[matchExpandShrinkPattern] status=" << toString(status)
                      << " -> expand backward\n";
@@ -624,237 +618,159 @@ private:
     llvm::SmallVector<Operation *, 256> nodes;
   };
 
-  // -------------------- helpers --------------------
-  static inline unsigned countDistinctUsers(Operation *op) {
-    llvm::SmallPtrSet<Operation *, 16> uniq;
-    for (Value r : op->getResults())
-      for (Operation *u : r.getUsers())
-        uniq.insert(u);
-    return (unsigned)uniq.size();
-  }
-  static inline bool isBranching(Operation *op, unsigned minFanout = 2) {
-    return countDistinctUsers(op) >= minFanout;
-  }
-  static Operation *nearestUpstreamBranching(
-      Operation *start, unsigned minFanout = 2) {
-    llvm::SmallPtrSet<Operation *, 32> vis;
-    llvm::SmallVector<Operation *, 32> wl{start};
-    while (!wl.empty()) {
-      Operation *op = wl.pop_back_val();
-      if (!vis.insert(op).second)
-        continue;
-      if (isBranching(op, minFanout))
-        return op;
-      for (Value in : op->getOperands())
-        if (Operation *def = in.getDefiningOp())
-          wl.push_back(def);
+  bool isForkOp(Operation *op) {
+    if (op->getNumResults() != 1) {
+      llvm::outs() << "[isForkOp] fail: op has multiple results.\n";
     }
-    return nullptr;
+
+    Value result = op->getResult(0);
+    return result.hasNUsesOrMore(2);
   }
-  static inline bool entryDominatesAll(Operation *entry, DominanceInfo &dom,
-      const llvm::SmallPtrSetImpl<Operation *> &ops) {
-    for (Operation *o : ops)
-      if (!dom.dominates(entry, o))
+
+  bool isJoinOp(Operation *op, llvm::SmallPtrSet<Operation *, 4> branches) {
+    for (Operation *branch : branches) {
+      llvm::DenseSet<Operation *> nodes = getForwardReachableNodes(branch, op);
+      if (!nodes.contains(op))
         return false;
+    }
+
     return true;
   }
-  static inline bool exitPostDominatesAll(Operation *exit,
-      PostDominanceInfo &pdom, const llvm::SmallPtrSetImpl<Operation *> &ops) {
-    for (Operation *o : ops)
-      if (!pdom.postDominates(exit, o))
-        return false;
-    return true;
-  }
-  static Operation *promoteEntryIfNeeded(
-      Operation *curEntry, Operation *witnessOp, DominanceInfo &dom) {
-    if (dom.dominates(curEntry, witnessOp))
-      return curEntry;
-    return nearestUpstreamBranching(witnessOp); // nullptr이면 실패 신호
-  }
-  static Operation *demoteExitIfNeeded(
-      Operation *curExit, Operation *witnessUser, PostDominanceInfo &pdom) {
-    if (pdom.postDominates(curExit, witnessUser))
-      return curExit;
-    return witnessUser; // 간단 전략: 필요 시 더 뒤의 user로 내림
-  }
-  static void pruneToEssentialPath(Operation *entry, Operation *exit,
-      llvm::SmallPtrSetImpl<Operation *> &scope) {
-    llvm::SmallPtrSet<Operation *, 32> reachFromEntry, canReachExit, keep;
-    // forward(users) from entry
-    {
-      llvm::SmallVector<Operation *, 128> wl{entry};
-      while (!wl.empty()) {
-        Operation *op = wl.pop_back_val();
-        if (!scope.contains(op))
-          continue;
-        if (!reachFromEntry.insert(op).second)
-          continue;
-        for (Value r : op->getResults())
-          for (Operation *u : r.getUsers())
-            wl.push_back(u);
-      }
-    }
-    // backward(defs) to exit
-    {
-      llvm::SmallVector<Operation *, 128> wl{exit};
-      while (!wl.empty()) {
-        Operation *op = wl.pop_back_val();
-        if (!scope.contains(op))
-          continue;
-        if (!canReachExit.insert(op).second)
-          continue;
-        for (Value in : op->getOperands())
-          if (Operation *def = in.getDefiningOp())
-            wl.push_back(def);
-      }
-    }
-    for (Operation *op : scope)
-      if (reachFromEntry.contains(op) && canReachExit.contains(op))
-        keep.insert(op);
-    scope.clear();
-    for (Operation *op : keep)
-      scope.insert(op);
-  }
 
-  // -------------------- main (bool) --------------------
-  static bool matchForkJoinPattern(Operation *peakOp,
-      Operation *analysisRootOp, // 보통 func::FuncOp
-      IsolatedSubgraph &out) {
-    DominanceInfo dom(analysisRootOp);
-    PostDominanceInfo pdom(analysisRootOp);
+  subgraph matchForkJoinPattern(Operation *peakOp) {
+    Operation *forkOp = nullptr;
+    Operation *joinOp = nullptr;
+    bool foundFork = false;
+    bool foundJoin = false;
+    SmallPtrSet<Operation *, 32> visited;
+    std::queue<Operation *> backwardWorklist;
+    std::queue<Operation *> forwardWorklist;
+    llvm::SmallPtrSet<Operation *, 4> branches;
+    IsolateStatus status = IsolateStatus::None;
 
-    // 1) 초기 S/E: S = seed에서 가장 가까운 분기(upstream), E = seed
-    Operation *entryGate = nearestUpstreamBranching(peakOp, /*fanout=*/2);
-    if (!entryGate)
-      return false; // S must be branching
-    Operation *exitGate = peakOp;
-
-    // 2) seed 시작 lazy 확장 (게이트 위반 시 S/E를 ‘필요한 만큼’만 조정)
-    llvm::SmallPtrSet<Operation *, 32> subgraphOps;
-    llvm::SmallVector<Operation *, 32> worklist{peakOp};
-
-    for (int iter = 0; iter < 256 && !worklist.empty(); ++iter) {
-      Operation *op = worklist.pop_back_val();
-      if (subgraphOps.contains(op))
-        continue;
-
-      // 게이트 조건 미충족 시 S/E 조정
-      if (!dom.dominates(entryGate, op)) {
-        if (Operation *ne = promoteEntryIfNeeded(entryGate, op, dom))
-          entryGate = ne;
-        else
-          return false;
-        if (!dom.dominates(entryGate, op))
-          continue;
-      }
-      if (!pdom.postDominates(exitGate, op)) {
-        if (Operation *nx = demoteExitIfNeeded(exitGate, op, pdom))
-          exitGate = nx;
-        else
-          return false;
-        if (!pdom.postDominates(exitGate, op))
-          continue;
+    auto backwardSearch = [&]() {
+      // 기존 후보 S가 존재했다면 초기화
+      if (foundFork) {
+        forkOp = nullptr;
+        foundFork = false;
+        branches.clear();
       }
 
-      subgraphOps.insert(op);
+      while (!backwardWorklist.empty()) {
+        Operation *currentOp = backwardWorklist.front(); // 맨 앞 원소 확인
+        if (!currentOp)
+          continue;
+        backwardWorklist.pop(); // 맨 앞 원소 제거
 
-      // 입력 제약: entry 제외 내부 op는 외부 producer 불가
-      if (op != entryGate) {
-        for (Value in : op->getOperands()) {
-          if (Operation *def = in.getDefiningOp()) {
-            if (!subgraphOps.contains(def)) {
-              if (!dom.dominates(entryGate, def)) {
-                if (Operation *ne = promoteEntryIfNeeded(entryGate, def, dom))
-                  entryGate = ne;
-                else
-                  return false;
-              }
-              worklist.push_back(def);
-            }
-          } else {
-            // BlockArgument → 외부 입력. 정책에 따라 강제 실패
-            return false;
+        // constant 또는 noValue라면 skip
+        if (isa<ONNXConstantOp>(currentOp) || isa<ONNXNoneOp>(currentOp)) {
+          continue;
+        }
+
+        for (Value operand : currentOp->getOperands()) {
+          if (Operation *defOp = operand.getDefiningOp()) {
+            if (visited.insert(defOp).second)
+              backwardWorklist.push(defOp); // 상위 op를 worklist에 추가
           }
         }
-      }
 
-      // 출력 제약: exit 제외 내부 op의 결과는 외부 user 불가
-      if (op != exitGate) {
-        for (Value r : op->getResults()) {
-          for (Operation *u : r.getUsers()) {
-            if (!subgraphOps.contains(u)) {
-              if (!pdom.postDominates(exitGate, u)) {
-                if (Operation *nx = demoteExitIfNeeded(exitGate, u, pdom))
-                  exitGate = nx;
-                else
-                  return false;
-              }
-              worklist.push_back(u);
-            }
+        // 분기점이라면
+        if (isForkOp(currentOp)) {
+          forkOp = currentOp;
+          foundFork = true;
+          Value result = forkOp->getResult(0);
+          for (Operation *user : result.getUsers()) {
+            branches.insert(user);
           }
+          llvm::outs() << "    [backwardSearch] forkOp candidate: ";
+          printOpOneLine(forkOp);
+          llvm::outs() << "\n";
+          break;
         }
       }
+    };
+
+    auto forwardSearch = [&]() {
+      // 기존 후보 E가 존재했다면 초기화
+      if (foundJoin) {
+        joinOp = nullptr;
+        foundJoin = false;
+      }
+
+      while (!forwardWorklist.empty()) {
+        Operation *currentOp = forwardWorklist.front();
+        forwardWorklist.pop();
+
+        if (isa<ONNXConstantOp>(currentOp))
+          continue;
+
+        llvm::outs() << "    [forwardSearch] pop ";
+        printOpOneLine(currentOp);
+        llvm::outs() << "\n";
+
+        for (Value result : currentOp->getResults()) {
+          for (Operation *user : result.getUsers()) {
+            if (visited.insert(user).second)
+              forwardWorklist.push(user);
+          }
+        }
+
+        // 합류점이라면
+        if (isJoinOp(currentOp, branches)) {
+          joinOp = currentOp;
+          foundJoin = true;
+          llvm::outs() << "    [forwardSearch] forkOp candidate: ";
+          printOpOneLine(joinOp);
+          llvm::outs() << "\n";
+          break;
+        }
+      }
+    };
+
+    // [outs] 시작
+    llvm::outs() << "[matchForkJoinPattern] start: peak=";
+    printOpOneLine(peakOp);
+    llvm::outs() << "\n";
+
+    // peakOp를 wokrlist에 추가
+    if (visited.insert(peakOp).second) {
+      backwardWorklist.push(peakOp);
+      forwardWorklist.push(peakOp);
     }
 
-    if (subgraphOps.empty() || !isBranching(entryGate, 2))
-      return false;
+    while (status != IsolateStatus::Isolated) {
+      if (status == IsolateStatus::None) {
+        backwardSearch();
+        forwardSearch();
 
-    // 3) 더 좁게: U 내부에서 entry 뒤로, exit 앞으로 밀어 넣기
-    {
-      bool changed = true;
-      for (int k = 0; k < 32 && changed; ++k) {
-        changed = false;
-        // entry tighten
-        for (Operation *cand : subgraphOps) {
-          if (cand == entryGate || !isBranching(cand))
-            continue;
-          if (entryDominatesAll(cand, dom, subgraphOps) &&
-              dom.dominates(entryGate, cand)) {
-            entryGate = cand;
-            changed = true;
-          }
-        }
-        // exit tighten
-        for (Operation *cand : subgraphOps) {
-          if (cand == exitGate)
-            continue;
-          if (exitPostDominatesAll(cand, pdom, subgraphOps) &&
-              pdom.postDominates(cand, exitGate)) {
-            exitGate = cand;
-            changed = true;
-          }
-        }
+        subgraph candidateSubgraph = subgraph(forkOp, joinOp);
+
+        status = checkIsolation(candidateSubgraph);
+      } else if (status == IsolateStatus::ExternalInput) {
+        llvm::outs() << "[matchForkJoinPattern] status=" << toString(status)
+                     << " -> expand backward\n";
+        backwardSearch();
+        status = checkIsolation(subgraph(forkOp, joinOp));
+      } else if (status == IsolateStatus::ExternalOutput) {
+        llvm::outs() << "[matchForkJoinPattern] status=" << toString(status)
+                     << " -> expand forward\n";
+        forwardSearch();
+        status = checkIsolation(subgraph(forkOp, joinOp));
+      } else if (status == IsolateStatus::NotSplittable) {
+        llvm::outs() << "[matchForkJoinPattern] NotSplittable\n";
+        return subgraph{};
       }
+      llvm::outs() << "[matchForkJoinPattern] status now=" << toString(status)
+                   << "\n";
     }
 
-    // 4) 경로 프루닝: Entry→…→Exit 경로에 실제로 기여하는 op만
-    pruneToEssentialPath(entryGate, exitGate, subgraphOps);
+    llvm::outs() << "[matchForkJoinPattern] SPLITTABLE: S=";
+    printOpOneLine(forkOp);
+    llvm::outs() << "  E=";
+    printOpOneLine(joinOp);
+    llvm::outs() << "\n";
 
-    // 5) 최종 검증: 단일 entry/exit 격리
-    for (Operation *op : subgraphOps)
-      if (op != entryGate) {
-        for (Value in : op->getOperands()) {
-          if (Operation *def = in.getDefiningOp()) {
-            if (!subgraphOps.contains(def))
-              return false;
-          } else
-            return false;
-        }
-      }
-    for (Operation *op : subgraphOps)
-      if (op != exitGate) {
-        for (Value r : op->getResults())
-          for (Operation *u : r.getUsers())
-            if (!subgraphOps.contains(u))
-              return false;
-      }
-
-    // 6) 출력
-    out.entryGate = entryGate;
-    out.exitGate = exitGate;
-    out.nodes.clear();
-    out.nodes.insert(out.nodes.end(), subgraphOps.begin(), subgraphOps.end());
-    return true;
+    return subgraph(forkOp, joinOp);
   }
 
   subgraph matchMergeShrinkPattern(Operation *peakOp) {
@@ -1015,21 +931,21 @@ private:
                           "reduction dimension. \n  Op: ";
           printOpOneLine(op);
           llvm::outs() << "\n Dim: " << dimension;
+          return false;
         }
-        return false;
       }
 
       if (!isa<ONNXConstantOp>(opB)) {
-        TensorType tensorTypeA = dyn_cast<TensorType>(a.getType());
-        auto shape = tensorTypeA.getShape();
+        TensorType tensorTypeB = dyn_cast<TensorType>(b.getType());
+        auto shape = tensorTypeB.getShape();
         // 뒤에서 두번째 차원
         if (shape.size() - 2 == dimension) {
           llvm::outs() << "[isDimPreserved] Failed: target dimension is "
                           "reduction dimension. Op: ";
           printOpOneLine(op);
           llvm::outs() << "\n";
+          return false;
         }
-        return false;
       }
 
       Value outVal = matmulOp.getResult();
@@ -1087,14 +1003,28 @@ private:
         llvm::outs() << "[isDimPreserved] failed: Unexpected ConcatOp.\n";
       }
     }
+    // MaxPool
+    else if (isa<ONNXMaxPoolSingleOutOp>(op)) {
+      if (dimension != 1) {
+        llvm::outs()
+            << "[isDimPreserved] fail: MaxPool has spatial dependency. Only "
+               "Channel dim (1) is splittable. Current dim: "
+            << dimension << "\n";
+        return false;
+      }
+      Value outVal = op->getResult(0);
+      for (Operation *userOp : outVal.getUsers()) {
+        return isDimPreserved(userOp, dimension, subgraph);
+      }
+    }
     // elementwise 연산일 경우
-    else if (isa<ONNXAddOp, ONNXClipOp, ONNXMulOp, ONNXSigmoidOp, ONNXGeluOp>(
-                 op)) {
+    else if (isa<ONNXAddOp, ONNXClipOp, ONNXMulOp, ONNXSigmoidOp, ONNXGeluOp,
+                 ONNXReluOp>(op)) {
       if (op == e) {
         return true;
       }
       if (op->getNumResults() != 1) {
-        llvm::outs() << "[isDimPreserved] Failed: Multiple results at Op: ";
+        llvm::outs() << "[isDimPreserved] fail: Multiple results at Op: ";
         printOpOneLine(op);
         llvm::outs() << "\n";
         return false;
@@ -1124,20 +1054,25 @@ private:
 
     auto userOps = sOut.getUsers();
 
-    for (int i = 1; i < rank; i++) {
+    for (int dimension = 1; dimension < rank; dimension++) {
       bool preserved = false;
 
       for (Operation *op : userOps) {
-        preserved = isDimPreserved(op, i, subgraph);
+        preserved = isDimPreserved(op, dimension, subgraph);
         if (!preserved) {
           break;
         }
       }
       if (preserved) {
-        splittableDims.insert(i);
+        splittableDims.insert(dimension);
       }
     }
 
+    llvm::outs() << "[getSplittableDims] Splittable Dimensions: ";
+    for (int64_t dim : splittableDims) {
+      llvm::outs() << dim << " ";
+    }
+    llvm::outs() << "\n";
     return splittableDims;
   }
 
