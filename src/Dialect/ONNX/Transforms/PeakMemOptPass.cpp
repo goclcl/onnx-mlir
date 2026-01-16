@@ -1445,47 +1445,57 @@ private:
         }
         // 2-4. Binary Element-wise (Add, Mul) 처리
         else if (isa<ONNXAddOp, ONNXMulOp>(clonedOp)) {
-          int64_t constRank, actRank;
-          Value constVal;
+          bool hasConst = false;
 
-          // cloned subgraph에서는 clonedOp의 상위 연산이 수정된 상태임.
-          // 따라서 원본 op에서 rank를 구해야함.
           for (Value v : op->getOperands()) {
             Operation *defOp = v.getDefiningOp();
-            auto rtt = dyn_cast<RankedTensorType>(v.getType());
-
-            // operand가 Constant일때
-            if (isa<ONNXConstantOp>(defOp)) {
-              constRank = rtt.getRank();
-              constVal = v;
-            }
-            // operand가 activation 일때
-            else {
-              actRank = rtt.getRank();
-            }
+            if (isa<ONNXConstantOp>(defOp))
+              hasConst = true;
           }
 
-          uint64_t operandIdx = 0;
-          int64_t constSplitDim = splitDim - (actRank - constRank);
+          if (hasConst) {
+            int64_t constRank, actRank;
+            Value constVal;
 
-          auto rtt = dyn_cast<RankedTensorType>(constVal.getType());
+            // cloned subgraph에서는 clonedOp의 상위 연산이 수정된 상태임.
+            // 따라서 원본 op에서 rank를 구해야함.
+            for (Value v : op->getOperands()) {
+              Operation *defOp = v.getDefiningOp();
+              auto rtt = dyn_cast<RankedTensorType>(v.getType());
 
-          // clonedOp의 operand를 순회하여 constant를 찾아 분할
-          for (Value v : clonedOp->getOperands()) {
-            Operation *defOp = v.getDefiningOp();
-            // Constant이면서 Broadcasting이 아닌 경우(splitDimSize > 1)에만
-            // 분할
-            if (isa<ONNXConstantOp>(defOp) && constSplitDim > -1) {
-              int64_t splitDimSize = rtt.getDimSize(constSplitDim);
-              if (splitDimSize > 1) {
-                auto splitVal =
-                    splitValue(builder, loc, v, constSplitDim)[pathIdx];
-                clonedOp->setOperand(operandIdx, splitVal);
-              } else {
-                llvm::outs() << "[subgraphSplit] fail: constSplitDim < 0";
+              // operand가 Constant일때
+              if (isa<ONNXConstantOp>(defOp)) {
+                constRank = rtt.getRank();
+                constVal = v;
+              }
+              // operand가 activation 일때
+              else {
+                actRank = rtt.getRank();
               }
             }
-            operandIdx++;
+
+            uint64_t operandIdx = 0;
+            int64_t constSplitDim = splitDim - (actRank - constRank);
+
+            auto rtt = dyn_cast<RankedTensorType>(constVal.getType());
+
+            // clonedOp의 operand를 순회하여 constant를 찾아 분할
+            for (Value v : clonedOp->getOperands()) {
+              Operation *defOp = v.getDefiningOp();
+              // Constant이면서 Broadcasting이 아닌 경우(splitDimSize > 1)에만
+              // 분할
+              if (isa<ONNXConstantOp>(defOp) && constSplitDim > -1) {
+                int64_t splitDimSize = rtt.getDimSize(constSplitDim);
+                if (splitDimSize > 1) {
+                  auto splitVal =
+                      splitValue(builder, loc, v, constSplitDim)[pathIdx];
+                  clonedOp->setOperand(operandIdx, splitVal);
+                } else {
+                  llvm::outs() << "[subgraphSplit] fail: constSplitDim < 0";
+                }
+              }
+              operandIdx++;
+            }
           }
         }
 
