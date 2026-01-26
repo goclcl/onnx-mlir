@@ -120,19 +120,19 @@ struct PeakMemOptPass
       }
       /* ---------------Fork/Join--------------- */
 
-      /* ---------------Merge/Shrink--------------- */
-      subgraph mergeShrinkSubgraph = matchMergeShrinkPattern(peakOp);
+      /* ---------------Concat-Shrink--------------- */
+      subgraph concatShrinkSubgraph = matchMergeShrinkPattern(peakOp);
 
-      if (mergeShrinkSubgraph.getS()) {
-        llvm::outs() << "[detect Merge/Shrink] splittable subgraph: S=";
-        printOpOneLine(mergeShrinkSubgraph.getS());
+      if (concatShrinkSubgraph.getS()) {
+        llvm::outs() << "[detect Concat-Shrink] splittable subgraph: S=";
+        printOpOneLine(concatShrinkSubgraph.getS());
         llvm::outs() << "  E=";
-        printOpOneLine(mergeShrinkSubgraph.getE());
+        printOpOneLine(concatShrinkSubgraph.getE());
         llvm::outs() << "\n";
       } else {
-        llvm::outs() << "[detect Merge/Shrink] no matched pattern\n";
+        llvm::outs() << "[detect Concat-Shrink] no matched pattern\n";
       }
-      /* ---------------Merge/Shrink--------------- */
+      /* ---------------Concat-Shrink--------------- */
 
       /* ===============Check Splittability=============== */
       llvm::DenseSet<int64_t> exShSplittableDims;
@@ -146,19 +146,23 @@ struct PeakMemOptPass
       //   // TODO:
       // }
 
-      /* merge/shrink pattern */
-      // if (auto s = mergeShrinkSubgraph.getS()) {
+      // /* concat-shrink pattern 최적화*/
+      // if (auto s = concatShrinkSubgraph.getS()) {
       //   // TODO:
       //   ONNXConcatOp concatOp = dyn_cast<ONNXConcatOp>(s);
       //   int64_t splitDim = concatOp.getAxis();
-      //   if (!isDimPreserved(s, splitDim, mergeShrinkSubgraph)) {
+      //   if (!isDimPreserved(s, splitDim, concatShrinkSubgraph)) {
       //     llvm::outs()
-      //         << "[split Merge/Shrink] Concat dimension is not
-      //         splittable.\n";
+      //         << "[split Concat-Shrink] Concat dimension is not splittable.\n
+      //         ";
       //   } else {
-      //     optConcat(mergeShrinkSubgraph);
+      //     optConcat(concatShrinkSubgraph);
       //   }
       // }
+      // // 중복 처리를 피하기 위해 최적화된 ops는 coverdOps에 추가
+      // auto nodes = concatShrinkSubgraph.subgraphNodes;
+      // coveredOps.reserve(coveredOps.size() + nodes.size());
+      // coveredOps.insert(nodes.begin(), nodes.end());
 
       /* ===============Check Splittability=============== */
 
@@ -221,27 +225,36 @@ private:
   static int64_t getTensorSize(Value tensor) {
     Operation *defOp = tensor.getDefiningOp();
 
+    Type type = tensor.getType();
+
+    // value가 none이면 0반환
+    if (isa<NoneType>(type))
+      return 0;
+
     // defining op가 constant거나 noValue면 0 반환
     if (!isa<BlockArgument>(tensor)) { // null casting 방지
       if (isa<ONNXConstantOp>(defOp) || isa<ONNXNoneOp>(defOp))
         return 0;
     }
 
-    // TensorType이 아닐 때
-    TensorType tt;
-    if (!(tt = dyn_cast<TensorType>(tensor.getType())))
-      return 0;
+    RankedTensorType rtt = dyn_cast<RankedTensorType>(type);
+    if (!rtt) {
+      llvm::outs() << "[getTensorSize] fail: Unranked tensor at ";
+      printOpOneLine(defOp);
+      llvm::outs() << "\n";
+      return -1;
+    }
 
-    Type elementType = tt.getElementType();
+    Type elementType = rtt.getElementType();
 
     unsigned bitWidth = elementType.getIntOrFloatBitWidth();
 
     int64_t total = 1;
-    for (int64_t d : tt.getShape()) {
+    for (int64_t d : rtt.getShape()) {
       if (d == ShapedType::kDynamic) {
         // 동적 차원 발견 시 에러
         llvm::errs()
-            << "[PeakMemOptPass] fail: dynamic dimension found in type: " << tt
+            << "[getTensorSize] fail: dynamic dimension found in type: " << rtt
             << "\n";
         return -1;
       }
@@ -620,7 +633,9 @@ private:
 
   bool isForkOp(Operation *op) {
     if (op->getNumResults() != 1) {
-      llvm::outs() << "[isForkOp] fail: op has multiple results.\n";
+      llvm::outs() << "[isForkOp] Multiple results at op: ";
+      printOpOneLine(op);
+      llvm::outs() << "\n";
     }
 
     Value result = op->getResult(0);
@@ -719,7 +734,7 @@ private:
         if (isJoinOp(currentOp, branches)) {
           joinOp = currentOp;
           foundJoin = true;
-          llvm::outs() << "    [forwardSearch] forkOp candidate: ";
+          llvm::outs() << "    [forwardSearch] joinOp candidate: ";
           printOpOneLine(joinOp);
           llvm::outs() << "\n";
           break;
@@ -834,19 +849,19 @@ private:
     };
 
     if (!(concatOp = findConcatOpBackward())) {
-      llvm::outs() << "[match Merge/Shrink] Cannot find Concat Op \n";
+      llvm::outs() << "[match Concat-Shrink] Cannot find Concat Op \n";
       return subgraph{};
     } else {
-      llvm::outs() << "[match Merge/Shrink] found Concat Op: ";
+      llvm::outs() << "[match Concat-Shrink] found Concat Op: ";
       printOpOneLine(concatOp);
       llvm::outs() << '\n';
     }
 
     if (!(shrinker = findShrinkerForward())) {
-      llvm::outs() << "[match Merge/Shrink] Cannot find Shrinker \n";
+      llvm::outs() << "[match Concat-Shrink] Cannot find Shrinker \n";
       return subgraph{};
     } else {
-      llvm::outs() << "[match Merge/Shrink] found Shrinker: ";
+      llvm::outs() << "[match Concat-Shrink] found Shrinker: ";
       printOpOneLine(shrinker);
       llvm::outs() << '\n';
     }
@@ -856,26 +871,26 @@ private:
     while (status != IsolateStatus::Isolated) {
       if (status == IsolateStatus::ExternalInput) {
         if (!(concatOp = findConcatOpBackward())) {
-          llvm::outs() << "[match Merge/Shrink] Cannot find Concat Op \n";
+          llvm::outs() << "[match Concat-Shrink] Cannot find Concat Op \n";
           return subgraph{};
         } else {
-          llvm::outs() << "[match Merge/Shrink] found Concat Op: ";
+          llvm::outs() << "[match Concat-Shrink] found Concat Op: ";
           printOpOneLine(concatOp);
           llvm::outs() << '\n';
           status = checkIsolation(subgraph(concatOp, shrinker));
         }
       } else if (status == IsolateStatus::ExternalOutput) {
         if (!(shrinker = findShrinkerForward())) {
-          llvm::outs() << "[match Merge/Shrink] Cannot find Shrinker \n";
+          llvm::outs() << "[match Concat-Shrink] Cannot find Shrinker \n";
           return subgraph{};
         } else {
-          llvm::outs() << "[match Merge/Shrink] found Shrinker: ";
+          llvm::outs() << "[match Concat-Shrink] found Shrinker: ";
           printOpOneLine(shrinker);
           llvm::outs() << '\n';
           status = checkIsolation(subgraph(concatOp, shrinker));
         }
       } else if (status == IsolateStatus::NotSplittable) {
-        llvm::outs() << "[match Merge/Shrink] status == NotSplittable \n";
+        llvm::outs() << "[match Concat-Shrink] status == NotSplittable \n";
         return subgraph{};
       }
     }
@@ -1304,6 +1319,7 @@ private:
       Value B = matmulOp.getB();
       auto aTy = dyn_cast<RankedTensorType>(A.getType());
       auto bTy = dyn_cast<RankedTensorType>(B.getType());
+
       auto sOutRank =
           dyn_cast<RankedTensorType>(matmulOp.getY().getType()).getRank();
       auto unrankedOutTy = UnrankedTensorType::get(aTy.getElementType());
@@ -1379,21 +1395,38 @@ private:
         else if (auto matmulOp = dyn_cast<ONNXMatMulOp>(clonedOp)) {
           // 원본 op에서 타입 정보 가져오기 (clonedOp는 이미 Unranked로 변경됨)
           auto origMatmulOp = dyn_cast<ONNXMatMulOp>(op);
+          Value origA = origMatmulOp.getA();
+          auto aTy = dyn_cast<RankedTensorType>(origA.getType());
           Value origB = origMatmulOp.getB();
           auto bTy = dyn_cast<RankedTensorType>(origB.getType());
 
           // clonedOp에서 현재 operand 가져오기
+          Value A = matmulOp.getA();
+          Operation *aDefOp = A.getDefiningOp();
+          bool aIsConst = aDefOp && isa<ONNXConstantOp>(aDefOp);
           Value B = matmulOp.getB();
           Operation *bDefOp = B.getDefiningOp();
           bool bIsConst = bDefOp && isa<ONNXConstantOp>(bDefOp);
 
           // splitDim은 현재 연산으로 들어오는 activation의 split dimension을
-          // 의미함. matmul에서 가능한 경우는
-          // activation X weight, activation X activation
-          // 두 가지인것으로 보여짐. 따라서 A는 일단 activation이라고 가정하자.
+          // 의미함. activation들은 이미 분할되어 들어오니까 weight들만
+          // 필요에따라 분할.
+          // matmul에서 가능한 경우:
+          // 1) activation X weight
+          // 2) weight X activation
+          // 3) activation X activation
           if (splitDim == 1) {
-            // splitDim == 1: A의 마지막에서 두 번째 차원(M)으로 분할
-            // A는 mapping으로 이미 분할된 값이 들어올거고 B는 분할 할 필요 없음
+            // splitDim == 1:
+            // case 1의 경우 A의 M 차원 분할임. A는 mapping으로 이미 분할된 값이
+            // 들어올거고 B는 분할 할 필요 없음 case 2의 경우 B의 K 차원 분할임.
+            // 따라서 A도 K차원으로 분할해야함. 추후 add로 병합
+            if (aIsConst && (!bIsConst)) {
+              int64_t splitAxis = aTy.getRank() - 1;
+              auto aSplit =
+                  splitValue(builder, matmulOp.getLoc(), A, splitAxis)[pathIdx];
+              matmulOp->setOperand(0, aSplit);
+              mergeKind = MergeKind::Add;
+            }
           } else if (splitDim == 2) {
             // splitDim == 2: A의 마지막 차원(K)으로 분할
             // ** op == e인 경우에만 여기 들어올 수 있음
@@ -1415,7 +1448,6 @@ private:
                             "MatMul in path.\n";
           }
         }
-
         // 2-3. ReshapeOp 처리
         else if (auto reshapeOp = dyn_cast<ONNXReshapeOp>(clonedOp)) {
           Value shapeVal = reshapeOp.getShape();
@@ -1568,11 +1600,11 @@ private:
 
   /*-------------------------------------------*/
 
-  void optConcat(subgraph mergeShrinkSubgraph) {
-    llvm::outs() << "[optConcat] Optimizing Merge/Shrink pattern.\n";
+  void optConcat(subgraph concatShrinkSubgraph) {
+    llvm::outs() << "[optConcat] Optimizing Concat-Shrink pattern.\n";
 
-    Operation *s = mergeShrinkSubgraph.getS();
-    Operation *e = mergeShrinkSubgraph.getE();
+    Operation *s = concatShrinkSubgraph.getS();
+    Operation *e = concatShrinkSubgraph.getE();
 
     auto concatOp = dyn_cast<ONNXConcatOp>(s);
     if (!concatOp) {
@@ -1593,8 +1625,10 @@ private:
     Operation *prev = s;
 
     // concat의 각 입력에 대해 브랜치 하나씩 만들기
+    // concat 후속 연산들을 clone하여 concat의 입력과 이어줌
     auto inputs = concatOp.getInputs();
-    for (size_t i = 0; i < inputs.size(); i++) { // 또는 s->getOperands()
+    int64_t numBranches = inputs.size();
+    for (int64_t i = 0; i < numBranches; i++) { // 또는 s->getOperands()
       Value in = inputs[i];
       IRMapping mapping;
 
@@ -1603,7 +1637,7 @@ private:
 
       // subgraphNodes: [S, op1, op2, ..., E] 라고 가정하고
       for (Operation *op :
-          llvm::drop_begin(mergeShrinkSubgraph.subgraphNodes, 1)) {
+          llvm::drop_begin(concatShrinkSubgraph.subgraphNodes, 1)) {
         // 원래 op 바로 뒤에 두는 대신, 이 브랜치의 prev 뒤에 붙이는 게 깔끔함
         builder.setInsertionPointAfter(prev);
 
@@ -1632,7 +1666,33 @@ private:
             } else {
               llvm::outs() << "[optConcat] fail: Unexpected splitDim: "
                            << splitDim << "\n";
+              return;
             }
+          } else if (auto reshapeOp = dyn_cast<ONNXReshapeOp>(clonedOp)) {
+            Value shapeVal = reshapeOp.getShape();
+            if (auto constOp =
+                    dyn_cast<ONNXConstantOp>(shapeVal.getDefiningOp())) {
+              if (auto denseAttr =
+                      dyn_cast<DenseElementsAttr>(constOp.getValueAttr())) {
+                builder.setInsertionPoint(constOp); // 상수 생성 위치 설정
+
+                SmallVector<int64_t, 4> shapeVals;
+                for (int64_t v : denseAttr.getValues<int64_t>())
+                  shapeVals.push_back(v);
+
+                if (shapeVals[splitDim] % numBranches == 0) {
+                  shapeVals[splitDim] /= numBranches; // 차원 줄여줌
+                  Value newConstVal = create.onnx.constantInt64(
+                      llvm::ArrayRef<int64_t>(shapeVals));
+                  reshapeOp.setOperand(1, newConstVal);
+                } else {
+                  llvm::errs() << "[optConcat] Warning: dim not divisible.\n";
+                }
+              }
+            }
+          } else {
+            llvm::outs() << "[optConcat] fail: Unknown Op.\n";
+            return;
           }
         } else if (op == e) {
           if (auto convOp = dyn_cast<ONNXConvOp>(clonedOp)) {
@@ -1668,6 +1728,64 @@ private:
               llvm::outs() << "[optConcat] fail: Unexpected splitDim: "
                            << splitDim << "\n";
             }
+          } else if (auto matmulOp = dyn_cast<ONNXMatMulOp>(clonedOp)) {
+            // 원본 op에서 타입 정보 가져오기 (clonedOp는 이미 Unranked로
+            // 변경됨)
+            auto origMatmulOp = dyn_cast<ONNXMatMulOp>(op);
+            Value origA = origMatmulOp.getA();
+            auto aTy = dyn_cast<RankedTensorType>(origA.getType());
+            Value origB = origMatmulOp.getB();
+            auto bTy = dyn_cast<RankedTensorType>(origB.getType());
+
+            // clonedOp에서 현재 operand 가져오기
+            Value A = matmulOp.getA();
+            Operation *aDefOp = A.getDefiningOp();
+            bool aIsConst = aDefOp && isa<ONNXConstantOp>(aDefOp);
+            Value B = matmulOp.getB();
+            Operation *bDefOp = B.getDefiningOp();
+            bool bIsConst = bDefOp && isa<ONNXConstantOp>(bDefOp);
+
+            // splitDim은 현재 연산으로 들어오는 activation의 split dimension을
+            // 의미함. activation들은 이미 분할되어 들어오니까 weight들만
+            // 필요에따라 분할.
+            // matmul에서 가능한 경우:
+            // 1) activation X weight
+            // 2) weight X activation
+            // 3) activation X activation
+            if (splitDim == 1) {
+              // splitDim == 1:
+              // case 1의 경우 A의 M 차원 분할임. A는 mapping으로 이미 분할된
+              // 값이 들어올거고 B는 분할 할 필요 없음 case 2의 경우 B의 K 차원
+              // 분할임. 따라서 A도 K차원으로 분할해야함. 추후 add로 병합
+              if (aIsConst && (!bIsConst)) {
+                int64_t splitAxis = aTy.getRank() - 1;
+                auto aSplit = splitValue(
+                    builder, matmulOp.getLoc(), A, splitAxis, numBranches)[i];
+                matmulOp->setOperand(0, aSplit);
+              }
+            } else if (splitDim == 2) {
+              // splitDim == 2: A의 마지막 차원(K)으로 분할
+              // ** op == e인 경우에만 여기 들어올 수 있음
+
+              // e에서 splitDim이 reduction되는 차원이므로 마지막에 Add로
+              // merge해야함.
+              // mergeKind = MergeKind::Add;
+
+              // B가 상수(weight)인 경우 분할 필요
+              if (bIsConst) {
+                int64_t splitAxis = bTy.getRank() - 2;
+                auto bSplit = splitValue(
+                    builder, matmulOp.getLoc(), B, splitAxis, numBranches)[i];
+                matmulOp.setOperand(1, bSplit);
+              }
+              // B가 변수라면 이미 mapping을 통해 분할된 값이 전달됨
+            } else {
+              llvm::outs() << "[optConcat] Warning: Unsupported splitDim for "
+                              "MatMul in path.\n";
+            }
+          } else {
+            llvm::outs() << "[optConcat] fail: E is unknown Op.\n";
+            return;
           }
         }
         // 결과 타입 수정
@@ -1685,38 +1803,28 @@ private:
     }
 
     // branchOutputs 합치기
-    // 현재 E가 standard conv일 경우에 대해서면 구현 (Add로 합침)
-    // TODO:
-    //  - 나머지 conv에 대해서는 concat으로 합치고
-    //  - MatMul일 경우에는 splitDim이 reduction axis라면 sum, 아니면 concat으로
-    //    합치면 됨
-    if (auto convOp = dyn_cast<ONNXConvOp>(e)) {
-      std::string convType = getConvTypeName(convOp);
-      if (splitDim == 1) {
-        if (convType == "Standard" || convType == "Pointwise") {
-          Value y = convOp.getY();
-          auto elemType = dyn_cast<TensorType>(y.getType()).getElementType();
-          auto newType = UnrankedTensorType::get(elemType);
-          Value sumResult = create.onnx.sum(newType, branchOutputs);
+    // 현재 Add로만 합치도록 구현함.
+    // TODO: Concat 병합
+    Value result = e->getResult(0);
+    auto elemType = dyn_cast<TensorType>(result.getType()).getElementType();
+    auto newType = UnrankedTensorType::get(elemType);
+    Value sumResult = create.onnx.sum(newType, branchOutputs);
 
-          // e의 result를 sum의 result로 갈아끼우기
-          y.replaceAllUsesWith(sumResult);
-        }
-      }
-    }
+    // e의 result를 sum의 result로 갈아끼우기
+    result.replaceAllUsesWith(sumResult);
 
     /*------------기존 연산 지우기------------*/
     // subgraph의 연산들에 역순으로 접근
-    for (auto it = mergeShrinkSubgraph.subgraphNodes.rbegin(),
-              end = mergeShrinkSubgraph.subgraphNodes.rend();
+    for (auto it = concatShrinkSubgraph.subgraphNodes.rbegin(),
+              end = concatShrinkSubgraph.subgraphNodes.rend();
          it != end; it++) {
       Operation *op = *it;
       op->erase();
     }
-    mergeShrinkSubgraph.subgraphNodes.clear();
+    concatShrinkSubgraph.subgraphNodes.clear();
 
     llvm::outs()
-        << "[optConcat] Merge/Shrink pattern is successfully optimized.\n";
+        << "[optConcat] Concat-Shrink pattern is successfully optimized.\n";
   }
 
   // ----[ DEBUG (outs) helpers ]----
