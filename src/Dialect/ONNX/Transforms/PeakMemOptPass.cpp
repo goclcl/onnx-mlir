@@ -36,6 +36,14 @@ struct PeakMemOptPass
     return "Performs graph transformations to lower the peak memory usage.";
   }
 
+  Option<bool> greedyOpt{*this, "greedy",
+      llvm::cl::desc(
+          "Keep optimizing successive peaks until no viable pattern remains "
+          "(previously split regions may split again if they become the "
+          "peak). Default: stop once the initial peak value is resolved "
+          "(one wave)."),
+      llvm::cl::init(false)};
+
   PeakMemOptPass() = default;
   PeakMemOptPass(const PeakMemOptPass &pass)
       : PassWrapper<PeakMemOptPass, OperationPass<func::FuncOp>>() {}
@@ -43,11 +51,14 @@ struct PeakMemOptPass
   void runOnOperation() override {
     func::FuncOp funcOp = getOperation();
     // 무한 루프 방지용 안전 상한 (정상 경로는 피크 변화/후보 소진으로 종료).
-    constexpr int kMaxRewrites = 32;
+    const int maxRewrites = greedyOpt ? 256 : 32;
+
+    if (greedyOpt)
+      pmoDbg() << "[driver] greedy mode\n";
 
     int rewrites = 0;
     int64_t targetPeak = -1;
-    for (int iter = 0; iter < kMaxRewrites; ++iter) {
+    for (int iter = 0; iter < maxRewrites; ++iter) {
       if (!tryRewriteOnce(funcOp, targetPeak, iter))
         break;
       ++rewrites;
@@ -58,10 +69,13 @@ struct PeakMemOptPass
   // 분석 → 매칭 → 계획 → 선택 → 실행 사이클 1회. rewrite가 일어나면 true.
   //
   // 매 호출마다 liveness를 새로 계산한다(rewrite 후의 재사용은 stale).
-  // targetPeak은 첫 분석의 전역 피크 값으로, 이 실행(wave)이 낮추려는
-  // 대상이다: 같은 값으로 묶인 피크 영역들을 모두 처리해 피크가 실제로
-  // 변하면 종료한다. 낮아진 피크를 계속 다시 쪼개는 것은 의도적으로 하지
-  // 않는다(분할 깊이가 무한히 깊어지는 것을 막는 1-wave 계약).
+  // 기본 모드: targetPeak(첫 분석의 전역 피크 값)이 이 실행(wave)이 낮추려는
+  // 대상이며, 같은 값으로 묶인 피크 영역들을 모두 처리해 피크가 실제로
+  // 변하면 종료한다(분할 깊이가 깊어지는 것을 막는 1-wave 계약).
+  // greedy 모드: 피크 값 변화와 무관하게, 현재 피크에서 분할 가능한 패턴이
+  // 더 이상 없을 때까지 계속한다. 이전 rewrite가 만든 영역도 피크가 되면
+  // 다시 분할될 수 있다 — 반복 적용으로 피크를 계속 낮추기 위함이며,
+  // 종료는 규칙의 자연 한계(차원 고갈, 전파 실패)와 상한이 보장한다.
   bool tryRewriteOnce(func::FuncOp funcOp, int64_t &targetPeak, int iter) {
     Liveness liveness(funcOp);
 
@@ -86,7 +100,7 @@ struct PeakMemOptPass
 
     if (targetPeak == -1)
       targetPeak = peakBytes;
-    if (peakBytes != targetPeak) {
+    if (!greedyOpt && peakBytes != targetPeak) {
       pmoDbg() << "[driver] peak changed " << targetPeak << "B -> " << peakBytes
                << "B; done\n";
       return false;

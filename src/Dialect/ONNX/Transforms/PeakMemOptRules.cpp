@@ -12,6 +12,7 @@
 #include "mlir/IR/BuiltinTypes.h"
 
 #include "src/Dialect/ONNX/ONNXOps.hpp"
+#include "src/Dialect/ONNX/Transforms/PeakMemOptUtils.hpp"
 
 using namespace mlir;
 
@@ -22,10 +23,10 @@ namespace {
 
 //===--------------------- 공용 헬퍼 ---------------------===//
 
-bool isConstantValue(Value v) {
-  Operation *def = v.getDefiningOp();
-  return def && isa<ONNXConstantOp>(def);
-}
+// "상수로 취급 가능한 값"인가. 엔진이 앞선 재작성에서 만든 상수의 Split
+// 조각도 오프라인으로 접히므로 상수와 동일하게 본다 — 엔진 산출 conv 등을
+// 다시 weight-split할 수 있게 하는 핵심 조건.
+bool isConstantValue(Value v) { return isFoldedOffline(v); }
 
 bool isNoneValue(Value v) { return isa<NoneType>(v.getType()); }
 
@@ -321,7 +322,9 @@ struct ReshapeRule final : public SplitRule {
       step.results.push_back(SplitState::untouched());
       return step;
     }
-    if (!isConstantValue(reshape.getShape()))
+    // patchClone이 shape 상수의 값을 직접 읽어 재작성하므로, 여기서는
+    // 진짜 ONNXConstantOp만 허용한다 (Split 조각 등은 값을 읽을 수 없음).
+    if (!reshape.getShape().getDefiningOp<ONNXConstantOp>())
       return failure();
 
     auto inShape = getShapeOf(reshape.getData());

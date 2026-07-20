@@ -77,6 +77,12 @@ struct Subgraph {
 /// 메모리로 세지 않는다.
 bool isFoldedOffline(mlir::Value v);
 
+/// 결과가 오프라인으로 접히는 op(상수/NoValue/상수의 Split 등)인가.
+/// 탐색·고립 검사에서 이런 op는 상수와 동일하게 그래프 밖으로 취급한다.
+/// (엔진이 만든 가중치 Split 조각을 외부 입력으로 오인하지 않아야 엔진
+/// 산출 영역을 다시 매칭·분할할 수 있다.)
+bool isOfflineProducer(mlir::Operation *op);
+
 /// 텐서의 바이트 크기. none/오프라인 값은 0, unranked/동적 차원은 -1.
 int64_t getTensorSize(mlir::Value tensor);
 

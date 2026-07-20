@@ -10,6 +10,8 @@
 
 #include "src/Dialect/ONNX/Transforms/PeakMemOptPlanner.hpp"
 
+#include <functional>
+
 #include "llvm/ADT/STLExtras.h"
 
 #include "mlir/IR/Builders.h"
@@ -32,25 +34,32 @@ void executePlan(Subgraph &sg, const SubgraphPlan &plan) {
   OpBuilder builder(s);
 
   // v의 정의가 삽입 영역(원본 S 앞)을 지배하지 않으면 — 원본 그래프에서
-  // S 뒤에 정의된 상수 — insertBefore 앞으로 상수를 복제해 지배시킨다.
+  // S 뒤에 정의된 상수류 — insertBefore 앞으로 복제해 지배시킨다.
+  // 상수/NoValue뿐 아니라 상수의 Split 조각(앞선 재작성이 만든 가중치
+  // 슬라이스)도 오퍼랜드까지 재귀적으로 hoist한다.
   llvm::DenseMap<Value, Value> hoisted;
-  auto ensureDominates = [&](Value v, Operation *insertBefore) -> Value {
+  std::function<Value(Value, Operation *)> ensureDominates =
+      [&](Value v, Operation *insertBefore) -> Value {
     Operation *def = v.getDefiningOp();
     if (!def || def->getBlock() != s->getBlock() || def->isBeforeInBlock(s))
       return v;
     auto it = hoisted.find(v);
     if (it != hoisted.end())
       return it->second;
-    if (!isa<ONNXConstantOp, ONNXNoneOp>(def)) {
+    if (!isOfflineProducer(def)) {
       pmoDbg() << "[engine] warning: cannot hoist non-constant "
                << def->getName() << "\n";
       return v;
     }
     OpBuilder::InsertionGuard guard(builder);
     builder.setInsertionPoint(insertBefore);
-    Value copy = builder.clone(*def)->getResult(0);
-    hoisted[v] = copy;
-    return copy;
+    IRMapping map;
+    for (Value opnd : def->getOperands())
+      map.map(opnd, ensureDominates(opnd, insertBefore));
+    Operation *copy = builder.clone(*def, map);
+    for (auto [ri, r] : llvm::enumerate(def->getResults()))
+      hoisted[r] = copy->getResult(ri);
+    return hoisted[v];
   };
 
   // Partition 슬라이스 materialize: v의 axis를 n조각으로.

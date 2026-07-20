@@ -108,8 +108,8 @@ Subgraph matchExpandShrinkPattern(Operation *peakOp) {
         continue;
       backwardWorklist.pop();
 
-      // constant 또는 noValue라면 skip
-      if (isa<ONNXConstantOp>(currentOp) || isa<ONNXNoneOp>(currentOp))
+      // 오프라인으로 접히는 생산자(상수/NoValue/상수의 Split)라면 skip
+      if (isOfflineProducer(currentOp))
         continue;
 
       for (Value operand : currentOp->getOperands()) {
@@ -226,8 +226,8 @@ Subgraph matchForkJoinPattern(Operation *peakOp) {
         continue;
       backwardWorklist.pop();
 
-      // constant 또는 noValue라면 skip
-      if (isa<ONNXConstantOp>(currentOp) || isa<ONNXNoneOp>(currentOp)) {
+      // 오프라인으로 접히는 생산자(상수/NoValue/상수의 Split)라면 skip
+      if (isOfflineProducer(currentOp)) {
         continue;
       }
 
@@ -339,10 +339,10 @@ Subgraph matchMergeShrinkPattern(Operation *peakOp) {
 
       for (Value v : currentOp->getOperands()) {
         Operation *defOp = v.getDefiningOp();
-        // defOp가 null이거나 Constant거나 noValue면 스킵
+        // defOp가 null이거나 오프라인으로 접히는 생산자면 스킵
         // 이미 방문한 노드도 스킵
-        if (findConcatVisited.contains(defOp) || !defOp ||
-            isa<ONNXConstantOp>(defOp) || isa<ONNXNoneOp>(defOp))
+        if (!defOp || findConcatVisited.contains(defOp) ||
+            isOfflineProducer(defOp))
           continue;
         findConcatWorklist.push(defOp);
       }

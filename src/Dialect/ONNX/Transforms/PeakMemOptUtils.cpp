@@ -75,6 +75,10 @@ bool isFoldedOffline(Value v) {
   return false;
 }
 
+bool isOfflineProducer(Operation *op) {
+  return op && op->getNumResults() >= 1 && isFoldedOffline(op->getResult(0));
+}
+
 int64_t getTensorSize(Value tensor) {
   Operation *defOp = tensor.getDefiningOp();
 
@@ -223,9 +227,8 @@ llvm::DenseSet<Operation *> getBackwardReachableNodes(
       Operation *defOp = operand.getDefiningOp();
 
       // Block Argument(그래프 전체 입력 값)이거나 이미 방문한 노드는 스킵
-      // constant와 noValue op도 스킵
-      if (!defOp || visitedSet.contains(defOp) || isa<ONNXConstantOp>(defOp) ||
-          isa<ONNXNoneOp>(defOp)) {
+      // 오프라인으로 접히는 생산자(상수/NoValue/상수의 Split)도 스킵
+      if (!defOp || visitedSet.contains(defOp) || isOfflineProducer(defOp)) {
         continue;
       }
 
@@ -267,8 +270,8 @@ IsolateStatus checkIsolation(const Subgraph &subgraph) {
       for (Value operand : op->getOperands()) {
         Operation *defOp = operand.getDefiningOp();
 
-        // constant와 noValue op는 스킵
-        if (isa<ONNXConstantOp>(defOp) || isa<ONNXNoneOp>(defOp)) {
+        // 오프라인으로 접히는 값(상수/NoValue/상수의 Split)은 스킵
+        if (isFoldedOffline(operand)) {
           continue;
         }
 
