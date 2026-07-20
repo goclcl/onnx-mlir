@@ -387,6 +387,135 @@ struct ReshapeRule final : public SplitRule {
   }
 };
 
+//===--------------------- Transpose ---------------------===//
+// 파티션 축이 perm에 따라 자리만 옮겨 그대로 통과한다. 자를 것도 보정할
+// 것도 없다.
+
+struct TransposeRule final : public SplitRule {
+  // perm 배열을 얻는다 (attr이 없으면 ONNX 기본값 = 축 순서 뒤집기).
+  static SmallVector<int64_t, 4> getPerm(ONNXTransposeOp op, int64_t rank) {
+    SmallVector<int64_t, 4> perm;
+    if (auto permAttr = op.getPermAttr()) {
+      for (Attribute a : permAttr)
+        perm.push_back(cast<IntegerAttr>(a).getInt());
+    } else {
+      for (int64_t i = rank - 1; i >= 0; --i)
+        perm.push_back(i);
+    }
+    return perm;
+  }
+
+  FailureOr<OpSplitStep> propagate(Operation *op, ArrayRef<SplitState> operands,
+      int nBranches) const override {
+    auto transpose = dyn_cast<ONNXTransposeOp>(op);
+    if (!transpose || operands.empty())
+      return failure();
+    const SplitState &data = operands[0];
+    if (data.isReduced())
+      return failure();
+    OpSplitStep step;
+    if (data.isUntouched()) {
+      step.results.push_back(SplitState::untouched());
+      return step;
+    }
+    auto inShape = getShapeOf(transpose.getData());
+    if (!inShape)
+      return failure();
+    int64_t rank = inShape->size();
+    SmallVector<int64_t, 4> perm = getPerm(transpose, rank);
+    for (int64_t j = 0; j < rank; ++j) {
+      if (perm[j] == data.axis) {
+        step.results.push_back(SplitState::partitioned(j));
+        return step;
+      }
+    }
+    return failure();
+  }
+
+  SmallVector<InputSplitOption, 4> inputSplitOptions(
+      Operation *op) const override {
+    SmallVector<InputSplitOption, 4> options;
+    auto transpose = dyn_cast<ONNXTransposeOp>(op);
+    if (!transpose || isConstantValue(transpose.getData()))
+      return options;
+    auto inShape = getShapeOf(transpose.getData());
+    if (!inShape)
+      return options;
+    int64_t rank = inShape->size();
+    SmallVector<int64_t, 4> perm = getPerm(transpose, rank);
+    for (int64_t j = 0; j < rank; ++j)
+      options.push_back({0, perm[j], j});
+    return options;
+  }
+};
+
+//===--------------------- LayerNormalization ---------------------===//
+// 정규화는 axis 이후의 축들에서 일어난다. 그보다 앞선 축의 파티션은 정규화
+// 그룹들을 통째로 나누는 것이라 그대로 통과하며, scale/bias는 정규화 축
+// 위의 값이므로 건드릴 필요 없다. 정규화되는 축의 파티션은 통계가 조각마다
+// 달라지므로 불가.
+
+struct LayerNormRule final : public SplitRule {
+  FailureOr<OpSplitStep> propagate(Operation *op, ArrayRef<SplitState> operands,
+      int nBranches) const override {
+    auto ln = dyn_cast<ONNXLayerNormalizationOp>(op);
+    if (!ln || operands.empty())
+      return failure();
+    // scale/bias가 분할 대상 상태로 들어오는 경우는 다루지 않는다.
+    for (unsigned i = 1; i < operands.size(); ++i)
+      if (!operands[i].isUntouched())
+        return failure();
+    const SplitState &x = operands[0];
+    if (x.isReduced())
+      return failure();
+
+    auto xShape = getShapeOf(ln.getX());
+    if (!xShape)
+      return failure();
+    int64_t rank = xShape->size();
+    int64_t normAxis = ln.getAxis();
+    if (normAxis < 0)
+      normAxis += rank;
+
+    OpSplitStep step;
+    if (x.isUntouched()) {
+      for (unsigned i = 0; i < op->getNumResults(); ++i)
+        step.results.push_back(SplitState::untouched());
+      return step;
+    }
+    if (x.axis >= normAxis)
+      return failure(); // 정규화되는 축은 나눌 수 없다
+
+    // Y와 (있다면) Mean/InvStdDev 모두 앞쪽 축을 공유하므로 같은 축으로
+    // 파티션된다. NoneType 결과는 분할과 무관.
+    for (unsigned i = 0; i < op->getNumResults(); ++i) {
+      if (isa<NoneType>(op->getResult(i).getType()))
+        step.results.push_back(SplitState::untouched());
+      else
+        step.results.push_back(SplitState::partitioned(x.axis));
+    }
+    return step;
+  }
+
+  SmallVector<InputSplitOption, 4> inputSplitOptions(
+      Operation *op) const override {
+    SmallVector<InputSplitOption, 4> options;
+    auto ln = dyn_cast<ONNXLayerNormalizationOp>(op);
+    if (!ln || isConstantValue(ln.getX()))
+      return options;
+    auto xShape = getShapeOf(ln.getX());
+    if (!xShape)
+      return options;
+    int64_t rank = xShape->size();
+    int64_t normAxis = ln.getAxis();
+    if (normAxis < 0)
+      normAxis += rank;
+    for (int64_t d = 0; d < normAxis; ++d)
+      options.push_back({0, d, d});
+    return options;
+  }
+};
+
 //===--------------------- MaxPool ---------------------===//
 // 채널(1) 파티션만 통과. spatial은 커널 겹침(halo) 미지원.
 
@@ -550,6 +679,8 @@ SplitRuleRegistry::SplitRuleRegistry() {
   static MatMulRule matMulRule;
   static ReshapeRule reshapeRule;
   static MaxPoolRule maxPoolRule;
+  static TransposeRule transposeRule;
+  static LayerNormRule layerNormRule;
   static EltwiseUnaryRule unaryRule;
   static EltwiseBinaryRule binaryRule;
 
@@ -557,6 +688,8 @@ SplitRuleRegistry::SplitRuleRegistry() {
   exactRules["onnx.MatMul"] = &matMulRule;
   exactRules["onnx.Reshape"] = &reshapeRule;
   exactRules["onnx.MaxPoolSingleOut"] = &maxPoolRule;
+  exactRules["onnx.Transpose"] = &transposeRule;
+  exactRules["onnx.LayerNormalization"] = &layerNormRule;
   eltwiseUnaryRule = &unaryRule;
   eltwiseBinaryRule = &binaryRule;
 }

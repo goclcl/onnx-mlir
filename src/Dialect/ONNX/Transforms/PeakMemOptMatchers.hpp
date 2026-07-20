@@ -16,8 +16,7 @@
 namespace onnx_mlir {
 namespace peakmem {
 
-Subgraph matchExpandShrinkPattern(
-    mlir::Operation *peakOp, uint32_t detectionScope);
+Subgraph matchExpandShrinkPattern(mlir::Operation *peakOp);
 
 Subgraph matchForkJoinPattern(mlir::Operation *peakOp);
 

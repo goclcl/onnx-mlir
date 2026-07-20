@@ -2,11 +2,12 @@
 
 // Fork/Join pattern: SiLU (x * sigmoid(x)), the efficientnetv2/yolov10s
 // case. The Conv output forks into Sigmoid and Mul; the branches rejoin at
-// Mul (E). The expand/shrink matcher only accepts single chains, so it must
-// DEFER this region (it contains a fork) and the fork/join matcher must
-// claim it — same plan/engine either way. Verifies the path cloner handles
-// a DAG (not just a chain): each half must get its own Sigmoid AND Mul
-// wired to the same half-Conv, merged with Concat(axis=1).
+// Mul (E). The expand/shrink matcher only accepts single chains — a fork
+// producer cannot head a chain, so its search skips past the Conv and finds
+// NO match here; the fork/join matcher claims the region instead. Verifies
+// the path cloner handles a DAG (not just a chain): each half must get its
+// own Sigmoid AND Mul wired to the same half-Conv, merged with
+// Concat(axis=1).
 func.func @fork_join_silu(%arg0: tensor<1x8x16x16xf32>) -> tensor<1x16x16x16xf32> {
   %w = onnx.Constant dense<1.000000e-01> : tensor<16x8x3x3xf32>
   %b = onnx.Constant dense<2.000000e-01> : tensor<16xf32>

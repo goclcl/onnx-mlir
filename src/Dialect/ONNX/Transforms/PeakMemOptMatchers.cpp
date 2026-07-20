@@ -76,7 +76,7 @@ bool isJoinOp(Operation *op, const llvm::SmallPtrSet<Operation *, 4> &branches) 
 
 } // namespace
 
-Subgraph matchExpandShrinkPattern(Operation *peakOp, uint32_t detectionScope) {
+Subgraph matchExpandShrinkPattern(Operation *peakOp) {
   Operation *expander = nullptr;
   Operation *shrinker = nullptr;
   llvm::SmallPtrSet<Operation *, 32> visited;
@@ -87,7 +87,7 @@ Subgraph matchExpandShrinkPattern(Operation *peakOp, uint32_t detectionScope) {
 
   pmoDbg() << "[matchExpandShrinkPattern] start: peak=";
   printOpOneLine(peakOp);
-  pmoDbg() << " scope=" << detectionScope << "\n";
+  pmoDbg() << "\n";
 
   // peakOp를 worklist에 추가
   if (visited.insert(peakOp).second) {
@@ -102,17 +102,15 @@ Subgraph matchExpandShrinkPattern(Operation *peakOp, uint32_t detectionScope) {
       foundExpander = false;
     }
 
-    while (detectionScope > 0 && !backwardWorklist.empty()) {
+    while (!backwardWorklist.empty()) {
       Operation *currentOp = backwardWorklist.front();
       if (!currentOp)
         continue;
       backwardWorklist.pop();
 
       // constant 또는 noValue라면 skip
-      if (isa<ONNXConstantOp>(currentOp) || isa<ONNXNoneOp>(currentOp)) {
+      if (isa<ONNXConstantOp>(currentOp) || isa<ONNXNoneOp>(currentOp))
         continue;
-      } else
-        detectionScope--;
 
       for (Value operand : currentOp->getOperands()) {
         if (Operation *defOp = operand.getDefiningOp()) {
@@ -121,7 +119,12 @@ Subgraph matchExpandShrinkPattern(Operation *peakOp, uint32_t detectionScope) {
         }
       }
 
-      if (checkTensorSizeChange(currentOp) == TensorSizeChange::EXPAND) {
+      // 체인 헤드 조건: 출력이 곧장 갈라지는(사용자 ≥2) op는 단일 체인의
+      // 시작이 될 수 없다 — 그런 fork 생산자는 fork/join 패턴의 소관이므로
+      // S 후보로 잡지 않고 탐색을 더 위로 계속한다.
+      if (checkTensorSizeChange(currentOp) == TensorSizeChange::EXPAND &&
+          currentOp->getNumResults() == 1 &&
+          currentOp->getResult(0).hasOneUse()) {
         expander = currentOp;
         foundExpander = true;
         pmoDbg() << "    [backwardSearch] EXPAND candidate: ";
@@ -139,18 +142,16 @@ Subgraph matchExpandShrinkPattern(Operation *peakOp, uint32_t detectionScope) {
       foundShrinker = false;
     }
 
-    while (detectionScope > 0 && !forwardWorklist.empty()) {
+    while (!forwardWorklist.empty()) {
       Operation *currentOp = forwardWorklist.front();
       forwardWorklist.pop();
 
       if (isa<ONNXConstantOp>(currentOp))
         continue;
-      else
-        detectionScope--;
 
       pmoDbg() << "    [forwardSearch] pop ";
       printOpOneLine(currentOp);
-      pmoDbg() << " scopeLeft=" << detectionScope << "\n";
+      pmoDbg() << "\n";
 
       for (Value result : currentOp->getResults()) {
         for (Operation *user : result.getUsers()) {
@@ -173,20 +174,20 @@ Subgraph matchExpandShrinkPattern(Operation *peakOp, uint32_t detectionScope) {
   Subgraph result = growUntilIsolated("matchExpandShrinkPattern",
       backwardSearch, forwardSearch,
       [&]() { return Subgraph(expander, shrinker); },
-      [&]() { return detectionScope == 0; });
+      []() { return false; });
   if (!result.getS())
     return Subgraph{};
 
-  // expand/shrink는 "단일 체인" 패턴이다: 영역 내부에서 갈라졌다 다시
-  // 합쳐지는 토폴로지는 fork/join 패턴의 소관이므로, E가 아닌 노드의
-  // 결과가 둘 이상의 op에서 쓰이면 여기서는 매칭하지 않는다.
+  // expand/shrink는 "단일 체인" 패턴이다: 영역 안에 fork가 있으면 이 영역은
+  // 체인이 아니므로 매칭이 아니다. (S를 아무리 위로 올려도 fork는 영역 안에
+  // 남으므로 이 시점에서 종료가 맞다.)
   for (Operation *op : result.subgraphNodes) {
     if (op == result.getE())
       continue;
     for (Value r : op->getResults()) {
       if (!r.hasOneUse()) {
-        pmoDbg() << "[matchExpandShrinkPattern] region contains a fork "
-                    "-> deferring to fork/join\n";
+        pmoDbg() << "[matchExpandShrinkPattern] region is not a single "
+                    "chain -> no match\n";
         return Subgraph{};
       }
     }

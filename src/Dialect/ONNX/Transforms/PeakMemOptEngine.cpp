@@ -142,6 +142,8 @@ void executePlan(Subgraph &sg, const SubgraphPlan &plan) {
       // iteration의 liveness 재분석이 정확한 크기를 보게 하기 위함이며,
       // 이후의 shape inference와도 일치한다.
       for (auto [ri2, r] : llvm::enumerate(cloned->getResults())) {
+        if (isa<NoneType>(r.getType()))
+          continue; // 사용되지 않는 선택적 결과는 그대로 둔다
         const SplitState &st = step.results[ri2];
         auto origTy = dyn_cast<RankedTensorType>(op->getResult(ri2).getType());
         if (!origTy || !origTy.hasStaticShape()) {

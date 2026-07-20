@@ -97,16 +97,14 @@ struct PeakMemOptPass
 
     for (Operation *peakOp : peakOps) {
       /* ===============Match=============== */
-      const uint32_t DETECTION_SCOPE = 64;
-
-      Subgraph expandShrinkSubgraph =
-          matchExpandShrinkPattern(peakOp, DETECTION_SCOPE);
+      Subgraph expandShrinkSubgraph = matchExpandShrinkPattern(peakOp);
       Subgraph forkJoinSubgraph = matchForkJoinPattern(peakOp);
       Subgraph concatShrinkSubgraph = matchMergeShrinkPattern(peakOp);
 
       /* ===============Plan & Select & Rewrite=============== */
-      // 매칭된 후보 전부에 대해 계획을 세우고, 추정 피크 감소량이 최대인
-      // 것을 고른다(동률이면 좁은 범위 = 노드 수 적은 쪽). 세 패턴은 같은
+      // 매칭된 후보 전부에 대해 계획을 세우고, 가장 작은 서브그래프(노드 수
+      // 최소)에서 쪼개는 후보를 고른다 — 교란과 클로닝이 가장 적은 지점을
+      // 선호한다. 동률이면 추정 피크 감소량이 큰 쪽. 세 패턴은 같은
       // 계획/엔진을 쓰며, expand/shrink(단일 체인)와 fork/join(DAG)은
       // 정의상 같은 영역을 동시에 주장할 수 없다.
       struct Candidate {
@@ -132,14 +130,16 @@ struct PeakMemOptPass
 
       Candidate *best = &candidates[0];
       for (Candidate &c : llvm::drop_begin(candidates)) {
+        size_t nBest = best->sg->subgraphNodes.size();
+        size_t nC = c.sg->subgraphNodes.size();
         int64_t rBest = best->plan.oldPeak - best->plan.newPeak;
         int64_t rC = c.plan.oldPeak - c.plan.newPeak;
-        if (rC > rBest || (rC == rBest && c.sg->subgraphNodes.size() <
-                                              best->sg->subgraphNodes.size()))
+        if (nC < nBest || (nC == nBest && rC > rBest))
           best = &c;
       }
       pmoDbg() << "[select] " << candidates.size() << " candidate(s) -> "
-               << best->kind << " (est. reduction "
+               << best->kind << " (" << best->sg->subgraphNodes.size()
+               << " nodes, est. reduction "
                << (best->plan.oldPeak - best->plan.newPeak) << "B)\n";
 
       executePlan(*best->sg, best->plan);
