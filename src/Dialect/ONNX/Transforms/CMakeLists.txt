@@ -112,6 +112,11 @@ add_onnx_mlir_library(OMONNXStandardFuncReturnPass
 
 add_onnx_mlir_library(OMPeakMemOptPass
   PeakMemOptPass.cpp
+  PeakMemOptUtils.cpp
+  PeakMemOptMatchers.cpp
+  PeakMemOptPlanner.cpp
+  PeakMemOptEngine.cpp
+  PeakMemOptRules.cpp
 
   LINK_LIBS PUBLIC
     MLIRIR
