@@ -519,6 +519,60 @@ struct LayerNormRule final : public SplitRule {
   }
 };
 
+//===--------------------- Softmax ---------------------===//
+// softmax는 지정된 한 축 안에서만 정규화하므로, 그 축이 아닌 어떤 축의
+// 파티션도 값 변화 없이 통과한다 (LayerNorm과 달리 축 뒤쪽도 허용).
+// rank가 보존되므로 axis attr(양수/음수 모두)는 보정 없이 유효하다.
+// 검증: vit 1x12x197x197(axis=-1)을 head축(1)·query축(2)으로 수동 분할해
+// bit-exact 확인 (2026-07-20).
+
+struct SoftmaxRule final : public SplitRule {
+  FailureOr<OpSplitStep> propagate(Operation *op, ArrayRef<SplitState> operands,
+      int nBranches) const override {
+    auto sm = dyn_cast<ONNXSoftmaxOp>(op);
+    if (!sm || operands.empty())
+      return failure();
+    const SplitState &x = operands[0];
+    if (x.isReduced())
+      return failure();
+    OpSplitStep step;
+    if (x.isUntouched()) {
+      step.results.push_back(SplitState::untouched());
+      return step;
+    }
+    auto xShape = getShapeOf(sm.getInput());
+    if (!xShape)
+      return failure();
+    int64_t rank = xShape->size();
+    int64_t smAxis = sm.getAxis();
+    if (smAxis < 0)
+      smAxis += rank;
+    if (x.axis == smAxis)
+      return failure(); // 정규화되는 축은 나눌 수 없다
+    step.results.push_back(SplitState::partitioned(x.axis));
+    return step;
+  }
+
+  SmallVector<InputSplitOption, 4> inputSplitOptions(
+      Operation *op) const override {
+    SmallVector<InputSplitOption, 4> options;
+    auto sm = dyn_cast<ONNXSoftmaxOp>(op);
+    if (!sm || isConstantValue(sm.getInput()))
+      return options;
+    auto xShape = getShapeOf(sm.getInput());
+    if (!xShape)
+      return options;
+    int64_t rank = xShape->size();
+    int64_t smAxis = sm.getAxis();
+    if (smAxis < 0)
+      smAxis += rank;
+    for (int64_t d = 1; d < rank; ++d)
+      if (d != smAxis)
+        options.push_back({0, d, d});
+    return options;
+  }
+};
+
 //===--------------------- MaxPool ---------------------===//
 // 채널(1) 파티션만 통과. spatial은 커널 겹침(halo) 미지원.
 
@@ -684,6 +738,7 @@ SplitRuleRegistry::SplitRuleRegistry() {
   static MaxPoolRule maxPoolRule;
   static TransposeRule transposeRule;
   static LayerNormRule layerNormRule;
+  static SoftmaxRule softmaxRule;
   static EltwiseUnaryRule unaryRule;
   static EltwiseBinaryRule binaryRule;
 
@@ -693,6 +748,7 @@ SplitRuleRegistry::SplitRuleRegistry() {
   exactRules["onnx.MaxPoolSingleOut"] = &maxPoolRule;
   exactRules["onnx.Transpose"] = &transposeRule;
   exactRules["onnx.LayerNormalization"] = &layerNormRule;
+  exactRules["onnx.Softmax"] = &softmaxRule;
   eltwiseUnaryRule = &unaryRule;
   eltwiseBinaryRule = &binaryRule;
 }
