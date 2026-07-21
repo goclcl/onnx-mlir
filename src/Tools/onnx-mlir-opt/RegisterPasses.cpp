@@ -139,6 +139,16 @@ void registerOMPasses(int optLevel) {
     return createTensorSplittingPass();
   });
 
+  /// TensorSpilling Pass (TinyMo)
+  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+    return createTensorSpillingPass();
+  });
+
+  /// TinyMo 통합 드라이버
+  mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+    return createTinyMoPass();
+  });
+
   /// Peak Memory Analysis
   mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
     return createPeakMemoryAnalysis();

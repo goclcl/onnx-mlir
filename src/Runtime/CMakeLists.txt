@@ -24,6 +24,7 @@ add_onnx_mlir_library(cruntime STATIC
   OMSort.c
   OMTensor.c
   OMTensorList.c
+  OMTensorSpill.c
   OMUnique.c
   OnnxDataType.c
   ${ONNX_MLIR_SRC_ROOT}/src/Support/SmallFPConversion.c
@@ -52,6 +53,7 @@ add_onnx_mlir_library(OMTensorUtils
   OMSort.cpp
   OMTensor.cpp
   OMTensorList.cpp
+  OMTensorSpill.cpp
   OMUnique.cpp
   OnnxDataType.cpp
   ${ONNX_MLIR_SRC_ROOT}/src/Support/SmallFPConversion.c

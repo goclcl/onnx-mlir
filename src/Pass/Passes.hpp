@@ -99,6 +99,12 @@ std::unique_ptr<mlir::Pass> createProcessKrnlParallelClausePass();
 /// Pass for TensorSplitting
 std::unique_ptr<mlir::Pass> createTensorSplittingPass();
 
+/// Pass for TensorSpilling (TinyMo)
+std::unique_ptr<mlir::Pass> createTensorSpillingPass();
+
+/// TinyMo 통합 드라이버 (spilling + splitting, 기대 감소량으로 택일)
+std::unique_ptr<mlir::Pass> createTinyMoPass();
+
 /// Peak Memory Analysis
 std::unique_ptr<mlir::Pass> createPeakMemoryAnalysis();
 

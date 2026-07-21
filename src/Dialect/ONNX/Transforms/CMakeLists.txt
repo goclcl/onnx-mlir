@@ -110,10 +110,25 @@ add_onnx_mlir_library(OMONNXStandardFuncReturnPass
   OMShapeInference
   )
 
+add_onnx_mlir_library(OMTinyMo
+  TinyMoUtils.cpp
+  TensorSpillingPass.cpp
+  TinyMoPass.cpp
+
+  LINK_LIBS PUBLIC
+    MLIRFuncDialect          # func::FuncOp 사용
+    MLIRAnalysis             # Liveness
+    MLIRIR                   # IR Core
+    MLIRPass                 # pass 등록
+    MLIRSupport              # LLVM ADT
+    OMONNXOps                # ONNX 연산 (ONNXCustomOp 등)
+)
+
 add_onnx_mlir_library(OMTensorSplittingPass
   TensorSplittingPass.cpp
 
   LINK_LIBS PUBLIC
+    OMTinyMo                    # 분할 엔진(TinyMoUtils) 공유
     MLIRTransformUtils          # 패턴 매칭 등
     MLIRFuncDialect             # func dialect 사용
     MLIRAnalysis                # Liveness.h
