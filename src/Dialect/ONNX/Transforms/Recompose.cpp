@@ -32,6 +32,8 @@
 #include "src/Dialect/ONNX/ONNXOps.hpp"
 #include "src/Dialect/ONNX/ONNXOps/OpHelper.hpp"
 #include "src/Dialect/ONNX/ONNXOps/ShapeHelper.hpp"
+#include "llvm/Support/CommandLine.h"
+
 #include "src/Dialect/ONNX/Transforms/Recompose.hpp"
 #include "src/Pass/Passes.hpp"
 #include "src/Support/TypeUtilities.hpp"
@@ -39,6 +41,16 @@
 #define DEBUG_TYPE "recompose"
 
 using namespace mlir;
+
+// 같은 입력을 공유하는 병렬 conv들을 conv 1개 + activation Split로
+// 재병합하는 패턴의 게이트. 텐서 분할류 메모리 최적화(TinyMo tensor
+// splitting, weight-split 브랜치)가 만든 구조를 정확히 되돌려 풀사이즈
+// 중간 텐서를 부활시키므로, 그런 산출물을 컴파일할 때는 꺼야 한다.
+static llvm::cl::opt<bool> enableCombineParallelConv{
+    "enable-combine-parallel-conv",
+    llvm::cl::desc("Enable recomposing parallel Conv2D ops sharing an input "
+                   "into one Conv followed by a Split. Default is true."),
+    llvm::cl::init(true)};
 
 namespace onnx_mlir {
 // splits a tensor along a static axis into multiple outputs based on specified
@@ -917,7 +929,8 @@ void onnx_mlir::getRecomposeONNXToONNXPatterns(
   patterns.insert<RecomposeGeluFromMulPattern>(context);
   patterns.insert<RecomposeLayerNormFromMulPattern>(context);
   patterns.insert<RecomposeQLinearMatMulFromQuantizeLinearPattern>(context);
-  patterns.insert<CombineParallelConv2DPattern>(context);
+  if (enableCombineParallelConv)
+    patterns.insert<CombineParallelConv2DPattern>(context);
 }
 
 /*!
