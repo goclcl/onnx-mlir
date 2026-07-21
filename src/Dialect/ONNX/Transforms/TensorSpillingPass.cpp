@@ -73,7 +73,7 @@ struct TensorSpillingPass
       // 예상 새 피크: victim이 라이브에서 빠지는 cold range 내부에서만
       // bytes만큼 줄어든다. 개선이 없으면 적용하지 않고 종료.
       int64_t expectedNewPeak =
-          expectedPeakAfterSpill(funcOp, liveness, *cand);
+          onnx_mlir::tinymo::expectedPeakAfterSpill(funcOp, liveness, *cand);
       if (expectedNewPeak >= maxMemoryUsage) {
         llvm::outs() << "[TensorSpillingPass] Spill would not reduce the "
                         "peak ("
@@ -93,30 +93,6 @@ struct TensorSpillingPass
     }
   }
 
-  // spill 적용 시의 예상 전역 피크: cold range 내부(교체 구간)의 op는
-  // usage - bytes, 바깥은 usage 그대로의 최댓값.
-  static int64_t expectedPeakAfterSpill(
-      func::FuncOp funcOp, Liveness &liveness, const SpillCandidate &cand) {
-    int64_t newPeak = 0;
-    bool inside = false;
-    for (Operation &op : funcOp.getBody().front()) {
-      if (&op == cand.fetchBefore)
-        inside = false;
-      if (isa<ONNXConstantOp>(&op)) {
-        if (&op == cand.spillAfter)
-          inside = true;
-        continue;
-      }
-      int64_t usage =
-          memoryUsageAtOp(&op, liveness, /*includeConstants=*/false);
-      if (inside)
-        usage -= cand.bytes;
-      newPeak = std::max(newPeak, usage);
-      if (&op == cand.spillAfter)
-        inside = true;
-    }
-    return newPeak;
-  }
 };
 
 } // anonymous namespace

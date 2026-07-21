@@ -70,12 +70,33 @@ struct TinyMoPass
         break;
       }
 
-      // 두 방법의 후보와 기대 감소량
+      // 두 방법의 후보와 "예상 전역 피크 개선량". 같은 피크값 지점이
+      // 여럿이면 국소 감소가 전역 피크를 못 낮출 수 있으므로, 전역
+      // 시뮬레이션으로 게이트한다 — 개선 없는 변환은 적용하지 않는다.
       std::optional<SplitCandidate> splitCand = findSplitCandidate(peakOp);
       std::optional<SpillCandidate> spillCand =
           findSpillCandidate(funcOp, liveness, peakOp);
-      int64_t splitRed = splitCand ? splitExpectedReduction(*splitCand) : -1;
-      int64_t spillRed = spillCand ? spillExpectedReduction(*spillCand) : -1;
+      int64_t splitRed = -1, spillRed = -1;
+      if (splitCand) {
+        splitRed =
+            peakBytes - expectedPeakAfterSplit(funcOp, liveness, *splitCand);
+        if (splitRed <= 0) {
+          llvm::outs() << "[TinyMo] splitting would not reduce the global "
+                          "peak; dropped\n";
+          splitCand.reset();
+          splitRed = -1;
+        }
+      }
+      if (spillCand) {
+        spillRed =
+            peakBytes - expectedPeakAfterSpill(funcOp, liveness, *spillCand);
+        if (spillRed <= 0) {
+          llvm::outs() << "[TinyMo] spilling would not reduce the global "
+                          "peak; dropped\n";
+          spillCand.reset();
+          spillRed = -1;
+        }
+      }
 
       if (!splitCand && !spillCand) {
         llvm::outs() << "[TinyMo] no applicable optimization at peak; "

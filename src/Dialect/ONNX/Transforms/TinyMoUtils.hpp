@@ -78,6 +78,17 @@ inline int64_t spillExpectedReduction(const SpillCandidate &cand) {
   return cand.bytes;
 }
 
+/// spill 적용 시의 예상 전역 피크: cold range 내부의 op는 usage-bytes,
+/// 바깥은 usage 그대로의 최댓값. 같은 피크값 지점이 여럿이면 spill 하나로
+/// 전역 피크가 안 내려갈 수 있으므로, 적용 전에 이걸로 게이트한다.
+int64_t expectedPeakAfterSpill(mlir::func::FuncOp funcOp,
+    mlir::Liveness &liveness, const SpillCandidate &cand);
+
+/// split 적용 시의 예상 전역 피크: pw 중간 텐서가 라이브인 구간(pw~dw)의
+/// op는 usage - interBytes/2, 바깥은 그대로의 최댓값 (코스 추정).
+int64_t expectedPeakAfterSplit(mlir::func::FuncOp funcOp,
+    mlir::Liveness &liveness, const SplitCandidate &cand);
+
 /// spill/fetch 삽입. victim의 다음 접근이 2-입력 Concat이고 그 뒤 재사용이
 /// 없으면 fetch를 concat과 융합(om_fetch_concat2)해 fetched 중간 텐서를
 /// 실체화하지 않는다 (논문 Fig. 4(c)). spillId는 호출자가 증가시킨다.

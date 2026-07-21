@@ -428,6 +428,52 @@ std::optional<SpillCandidate> findSpillCandidate(
   return best;
 }
 
+int64_t expectedPeakAfterSpill(
+    func::FuncOp funcOp, Liveness &liveness, const SpillCandidate &cand) {
+  int64_t newPeak = 0;
+  bool inside = false;
+  for (Operation &op : funcOp.getBody().front()) {
+    if (&op == cand.fetchBefore)
+      inside = false;
+    if (isa<ONNXConstantOp>(&op)) {
+      if (&op == cand.spillAfter)
+        inside = true;
+      continue;
+    }
+    int64_t usage = memoryUsageAtOp(&op, liveness, /*includeConstants=*/false);
+    if (inside)
+      usage -= cand.bytes;
+    newPeak = std::max(newPeak, usage);
+    if (&op == cand.spillAfter)
+      inside = true;
+  }
+  return newPeak;
+}
+
+int64_t expectedPeakAfterSplit(
+    func::FuncOp funcOp, Liveness &liveness, const SplitCandidate &cand) {
+  ONNXConvOp pwOp = cand.pwConv;
+  ONNXConvOp dwOp = cand.dwConv;
+  Operation *pw = pwOp.getOperation();
+  Operation *dw = dwOp.getOperation();
+  int64_t half = cand.interBytes / 2;
+  int64_t newPeak = 0;
+  bool inside = false;
+  for (Operation &op : funcOp.getBody().front()) {
+    if (&op == pw)
+      inside = true;
+    if (isa<ONNXConstantOp>(&op))
+      continue;
+    int64_t usage = memoryUsageAtOp(&op, liveness, /*includeConstants=*/false);
+    if (inside)
+      usage -= half;
+    newPeak = std::max(newPeak, usage);
+    if (&op == dw)
+      inside = false;
+  }
+  return newPeak;
+}
+
 bool applyTensorSpilling(
     SpillCandidate &cand, OpBuilder &builder, int64_t spillId) {
   Value victim = cand.victim;
