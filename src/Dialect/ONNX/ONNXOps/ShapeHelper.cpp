@@ -922,13 +922,26 @@ ONNXCustomOpShapeHelper::ONNXCustomOpShapeHelper(Operation *op,
   setOperands(ValueRange(operandsVector));
 }
 
-bool ONNXCustomOpShapeHelper::isImplemented() { return pattern != 0; }
+bool ONNXCustomOpShapeHelper::isImplemented() { return true; }
 
 LogicalResult ONNXCustomOpShapeHelper::computeShape() {
   if (pattern == 1) {
     return ONNXUnaryOpShapeHelper::computeShape();
   } else if (pattern == 2) {
     return ONNXBroadcastOpShapeHelper::computeShape();
+  }
+  // shape_infer_pattern이 없는 CustomOp: 결과 타입이 이미 정적으로 확정돼
+  // 있으면 그 타입에서 dims를 읽는다. (om_spill/om_fetch처럼 패스가 결과
+  // 타입을 명시하고 패턴 없이 쓰는 경우 — lowering의 출력 alloc에 필요.)
+  for (unsigned i = 0; i < op->getNumResults(); ++i) {
+    auto rtt = mlir::dyn_cast<RankedTensorType>(op->getResult(i).getType());
+    if (!rtt || !rtt.hasStaticShape())
+      return op->emitError(
+          "CustomOp without shape_infer_pattern requires static result types");
+    DimsExpr dims;
+    for (int64_t d : rtt.getShape())
+      dims.emplace_back(LiteralIndexExpr(d));
+    setOutputDims(dims, i);
   }
   return success();
 }

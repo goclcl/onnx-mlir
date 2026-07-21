@@ -59,8 +59,11 @@ struct ONNXCustomOpLowering : public OpConversionPattern<ONNXCustomOp> {
 
     // Handle the attributes: exclude the attributes used for analysis
     // function_name is passed explicitly. Others may include shape inference
+    // onnx_node_name은 그래프 메타데이터일 뿐이므로 호출 인자로 전달하지
+    // 않는다 (문자열 인자가 끼어들면 런타임 함수의 ABI가 어긋난다).
     std::vector<std::string> excludeStrings = {"function_name",
-        "shape_infer_pattern", "inputs_for_infer", "output_element_type"};
+        "shape_infer_pattern", "inputs_for_infer", "output_element_type",
+        "onnx_node_name"};
     std::vector<std::string> attributeNames;
     for (NamedAttribute namedAttr : customOp->getAttrs()) {
       std::string attrName = namedAttr.getName().getValue().str();
