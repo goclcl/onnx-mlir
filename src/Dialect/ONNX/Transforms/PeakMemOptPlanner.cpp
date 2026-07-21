@@ -169,7 +169,10 @@ std::optional<SubgraphPlan> computePlan(Subgraph &sg, Liveness &liveness) {
     return std::nullopt;
   }
 
-  // ① weight-split 우선 (상수 operand 분할 — 오프라인 처리 가능)
+  // S는 weight-split만 허용한다(2026-07-21 사용자 결정): 시드는 S의 상수
+  // operand를 오프라인으로 자르는 것뿐이고, 후속 연산들은 전파로 쪼개진
+  // 입력을 받는다. S의 activation에 런타임 Split을 꽂는 input-split 시딩은
+  // 제거됨.
   if (auto seed = sRule->planWeightSplit(s, plan.nBranches); succeeded(seed)) {
     llvm::DenseMap<Value, SplitState> states;
     unsigned nSlices = 0;
@@ -177,53 +180,6 @@ std::optional<SubgraphPlan> computePlan(Subgraph &sg, Liveness &liveness) {
         planWalkFrom(sg, 1, states, plan, nSlices) &&
         planFinish(
             sg, liveness, states, nSlices, "weight-split", Value(), plan))
-      return plan;
-    plan.steps.clear();
-    pmoDbg() << "[planner] weight-split did not validate; trying "
-                "input-split\n";
-  }
-
-  // ② input-split 폴백 (상수가 아닌 입력에 런타임 Split)
-  auto options = sRule->inputSplitOptions(s);
-  llvm::SmallVector<std::pair<double, InputSplitOption>, 8> scored;
-  for (const InputSplitOption &opt : options) {
-    if (opt.inAxis == 0)
-      continue; // batch 축 금지
-    auto ty =
-        dyn_cast<RankedTensorType>(s->getOperand(opt.operandIdx).getType());
-    if (!ty || !ty.hasStaticShape())
-      continue;
-    int64_t dim = ty.getShape()[opt.inAxis];
-    if (dim < 2)
-      continue;
-    double balance = (double)((dim + 1) / 2) / (double)dim;
-    scored.push_back({balance, opt});
-  }
-  llvm::stable_sort(scored, [](auto &a, auto &b) { return a.first < b.first; });
-
-  for (auto &[balance, opt] : scored) {
-    llvm::DenseMap<Value, SplitState> states;
-    unsigned nSlices = 1; // 입력에 삽입될 런타임 Split 1개
-    plan.steps.clear();
-    plan.seedKind = SubgraphPlan::SeedKind::InputSplit;
-    plan.inputSeed = opt;
-    states[s->getOperand(opt.operandIdx)] =
-        SplitState::partitioned(opt.inAxis);
-    llvm::SmallVector<SplitState, 4> sStates;
-    for (Value v : s->getOperands()) {
-      auto it = states.find(v);
-      sStates.push_back(
-          it == states.end() ? SplitState::untouched() : it->second);
-    }
-    auto step = sRule->propagate(s, sStates, plan.nBranches);
-    if (failed(step) || !planApplyStep(s, e, *step, states, plan, nSlices))
-      continue;
-    std::string desc = "input-split(operand=" +
-                       std::to_string(opt.operandIdx) +
-                       ", axis=" + std::to_string(opt.inAxis) + ")";
-    if (planWalkFrom(sg, 1, states, plan, nSlices) &&
-        planFinish(sg, liveness, states, nSlices, desc,
-            s->getOperand(opt.operandIdx), plan))
       return plan;
   }
   pmoDbg() << "[planner] invalid: no viable split plan\n";
