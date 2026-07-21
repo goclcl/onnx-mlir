@@ -38,12 +38,21 @@ struct TinyMoPass
            "selected per iteration by expected reduction";
   }
 
+  Option<int> maxItersOpt{*this, "max-iters",
+      llvm::cl::desc("Stop after this many applied optimizations "
+                     "(default: repeat until no improvement)."),
+      llvm::cl::init(128)};
+
+  TinyMoPass() = default;
+  TinyMoPass(const TinyMoPass &pass)
+      : PassWrapper<TinyMoPass, OperationPass<func::FuncOp>>() {}
+
   void runOnOperation() override {
     func::FuncOp funcOp = getOperation();
     int64_t spillId = 0;
     int64_t prevPeak = -1;
-    // 무한 루프 방지 상한 (정상 종료는 후보 소진/개선 없음)
-    const int maxIters = 128;
+    // 상한: max-iters 옵션 (기본 128 = 사실상 후보 소진까지)
+    const int maxIters = maxItersOpt;
 
     for (int iter = 0; iter < maxIters; ++iter) {
       Liveness liveness(funcOp);
