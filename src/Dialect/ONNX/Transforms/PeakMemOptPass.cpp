@@ -109,57 +109,61 @@ struct PeakMemOptPass
     pmoDbg() << "\n[driver] iteration " << iter << ": peak " << peakBytes
              << "B at " << peakOps.size() << " op(s)\n";
 
-    for (Operation *peakOp : peakOps) {
-      /* ===============Match=============== */
-      Subgraph expandShrinkSubgraph = matchExpandShrinkPattern(peakOp);
-      Subgraph forkJoinSubgraph = matchForkJoinPattern(peakOp);
-      Subgraph concatShrinkSubgraph = matchMergeShrinkPattern(peakOp);
+    // 같은 피크 값을 가진 지점이 여럿이면 프로그램 순서상 첫 지점만 본다.
+    // 그 지점에서 분할이 불가능하면 피크는 그 값에 고정된 것이다 — 같은
+    // 값의 다른 지점을 아무리 쪼개도 전역 피크는 내려가지 않으므로
+    // 건너뛰지 않고 즉시 종료한다(2026-07-21 사용자 결정).
+    Operation *peakOp = peakOps.front();
 
-      /* ===============Plan & Select & Rewrite=============== */
-      // 매칭된 후보 전부에 대해 계획을 세우고, 가장 작은 서브그래프(노드 수
-      // 최소)에서 쪼개는 후보를 고른다 — 교란과 클로닝이 가장 적은 지점을
-      // 선호한다. 동률이면 추정 피크 감소량이 큰 쪽. 세 패턴은 같은
-      // 계획/엔진을 쓰며, expand/shrink(단일 체인)와 fork/join(DAG)은
-      // 정의상 같은 영역을 동시에 주장할 수 없다.
-      struct Candidate {
-        Subgraph *sg;
-        SubgraphPlan plan;
-        const char *kind;
-      };
-      llvm::SmallVector<Candidate, 3> candidates;
-      if (expandShrinkSubgraph.getS())
-        if (auto p = computePlan(expandShrinkSubgraph, liveness))
-          candidates.push_back({&expandShrinkSubgraph, *p, "expand/shrink"});
-      if (forkJoinSubgraph.getS())
-        if (auto p = computePlan(forkJoinSubgraph, liveness))
-          candidates.push_back({&forkJoinSubgraph, *p, "fork/join"});
-      if (concatShrinkSubgraph.getS())
-        if (auto p = computeConcatReusePlan(concatShrinkSubgraph, liveness))
-          candidates.push_back({&concatShrinkSubgraph, *p, "concat-shrink"});
+    /* ===============Match=============== */
+    Subgraph expandShrinkSubgraph = matchExpandShrinkPattern(peakOp);
+    Subgraph forkJoinSubgraph = matchForkJoinPattern(peakOp);
+    Subgraph concatShrinkSubgraph = matchMergeShrinkPattern(peakOp);
 
-      if (candidates.empty()) {
-        pmoDbg() << "[select] no viable plan at this peak op\n";
-        continue;
-      }
+    /* ===============Plan & Select & Rewrite=============== */
+    // 매칭된 후보 전부에 대해 계획을 세우고, 가장 작은 서브그래프(노드 수
+    // 최소)에서 쪼개는 후보를 고른다 — 교란과 클로닝이 가장 적은 지점을
+    // 선호한다. 동률이면 추정 피크 감소량이 큰 쪽. 세 패턴은 같은
+    // 계획/엔진을 쓰며, expand/shrink(단일 체인)와 fork/join(DAG)은
+    // 정의상 같은 영역을 동시에 주장할 수 없다.
+    struct Candidate {
+      Subgraph *sg;
+      SubgraphPlan plan;
+      const char *kind;
+    };
+    llvm::SmallVector<Candidate, 3> candidates;
+    if (expandShrinkSubgraph.getS())
+      if (auto p = computePlan(expandShrinkSubgraph, liveness))
+        candidates.push_back({&expandShrinkSubgraph, *p, "expand/shrink"});
+    if (forkJoinSubgraph.getS())
+      if (auto p = computePlan(forkJoinSubgraph, liveness))
+        candidates.push_back({&forkJoinSubgraph, *p, "fork/join"});
+    if (concatShrinkSubgraph.getS())
+      if (auto p = computeConcatReusePlan(concatShrinkSubgraph, liveness))
+        candidates.push_back({&concatShrinkSubgraph, *p, "concat-shrink"});
 
-      Candidate *best = &candidates[0];
-      for (Candidate &c : llvm::drop_begin(candidates)) {
-        size_t nBest = best->sg->subgraphNodes.size();
-        size_t nC = c.sg->subgraphNodes.size();
-        int64_t rBest = best->plan.oldPeak - best->plan.newPeak;
-        int64_t rC = c.plan.oldPeak - c.plan.newPeak;
-        if (nC < nBest || (nC == nBest && rC > rBest))
-          best = &c;
-      }
-      pmoDbg() << "[select] " << candidates.size() << " candidate(s) -> "
-               << best->kind << " (" << best->sg->subgraphNodes.size()
-               << " nodes, est. reduction "
-               << (best->plan.oldPeak - best->plan.newPeak) << "B)\n";
-
-      executePlan(*best->sg, best->plan);
-      return true;
+    if (candidates.empty()) {
+      pmoDbg() << "[select] no viable plan at the peak; peak is pinned "
+                  "-> done\n";
+      return false;
     }
-    return false;
+
+    Candidate *best = &candidates[0];
+    for (Candidate &c : llvm::drop_begin(candidates)) {
+      size_t nBest = best->sg->subgraphNodes.size();
+      size_t nC = c.sg->subgraphNodes.size();
+      int64_t rBest = best->plan.oldPeak - best->plan.newPeak;
+      int64_t rC = c.plan.oldPeak - c.plan.newPeak;
+      if (nC < nBest || (nC == nBest && rC > rBest))
+        best = &c;
+    }
+    pmoDbg() << "[select] " << candidates.size() << " candidate(s) -> "
+             << best->kind << " (" << best->sg->subgraphNodes.size()
+             << " nodes, est. reduction "
+             << (best->plan.oldPeak - best->plan.newPeak) << "B)\n";
+
+    executePlan(*best->sg, best->plan);
+    return true;
   }
 };
 
