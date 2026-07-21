@@ -48,7 +48,6 @@ std::optional<ArrayRef<int64_t>> getShapeOf(Value v) {
 //        group==1               → 입력채널이 수축되므로 result는 Reduced.
 //                                  W ax1 분할, bias는 ApplyOnce.
 //    * spatial(2,3)은 halo(경계 겹침) 처리가 없어 불가.
-//  - inputSplitOptions: 위 이유로 제공하지 않음(빈 목록).
 
 struct ConvRule final : public SplitRule {
   FailureOr<OpSplitStep> propagate(Operation *op, ArrayRef<SplitState> operands,
@@ -149,7 +148,6 @@ struct ConvRule final : public SplitRule {
 //    파티션된다. K 축을 자르는 계획은 내지 않는다(출력이 시작부터 부분합).
 //  - propagate: activation의 파티션 축이 K로 들어오면 result는 Reduced가 되고
 //    반대편 operand도 같은 K 조각을 갖도록 요구한다.
-//  - inputSplitOptions: 상수가 아닌 operand의 K가 아닌 축들.
 
 struct MatMulRule final : public SplitRule {
   FailureOr<OpSplitStep> propagate(Operation *op, ArrayRef<SplitState> operands,
@@ -271,34 +269,6 @@ struct MatMulRule final : public SplitRule {
       return step;
     }
     return failure();
-  }
-
-  SmallVector<InputSplitOption, 4> inputSplitOptions(
-      Operation *op) const override {
-    auto mm = dyn_cast<ONNXMatMulOp>(op);
-    SmallVector<InputSplitOption, 4> options;
-    if (!mm)
-      return options;
-    auto aShape = getShapeOf(mm.getA());
-    auto bShape = getShapeOf(mm.getB());
-    auto outShape = getShapeOf(mm.getY());
-    if (!aShape || !bShape || !outShape)
-      return options;
-    int64_t rA = aShape->size(), rB = bShape->size(), rO = outShape->size();
-    if (rA < 2 || rB < 2)
-      return options;
-
-    if (!isConstantValue(mm.getA()))
-      for (int64_t d = 0; d < rA - 1; ++d) // K(마지막)만 제외
-        options.push_back({0, d, d + (rO - rA)});
-    if (!isConstantValue(mm.getB()))
-      for (int64_t d = 0; d < rB; ++d) {
-        if (d == rB - 2)
-          continue; // K 제외
-        int64_t outAxis = (d == rB - 1) ? rO - 1 : d + (rO - rB);
-        options.push_back({1, d, outAxis});
-      }
-    return options;
   }
 };
 
@@ -434,22 +404,6 @@ struct TransposeRule final : public SplitRule {
     }
     return failure();
   }
-
-  SmallVector<InputSplitOption, 4> inputSplitOptions(
-      Operation *op) const override {
-    SmallVector<InputSplitOption, 4> options;
-    auto transpose = dyn_cast<ONNXTransposeOp>(op);
-    if (!transpose || isConstantValue(transpose.getData()))
-      return options;
-    auto inShape = getShapeOf(transpose.getData());
-    if (!inShape)
-      return options;
-    int64_t rank = inShape->size();
-    SmallVector<int64_t, 4> perm = getPerm(transpose, rank);
-    for (int64_t j = 0; j < rank; ++j)
-      options.push_back({0, perm[j], j});
-    return options;
-  }
 };
 
 //===--------------------- LayerNormalization ---------------------===//
@@ -499,24 +453,6 @@ struct LayerNormRule final : public SplitRule {
     }
     return step;
   }
-
-  SmallVector<InputSplitOption, 4> inputSplitOptions(
-      Operation *op) const override {
-    SmallVector<InputSplitOption, 4> options;
-    auto ln = dyn_cast<ONNXLayerNormalizationOp>(op);
-    if (!ln || isConstantValue(ln.getX()))
-      return options;
-    auto xShape = getShapeOf(ln.getX());
-    if (!xShape)
-      return options;
-    int64_t rank = xShape->size();
-    int64_t normAxis = ln.getAxis();
-    if (normAxis < 0)
-      normAxis += rank;
-    for (int64_t d = 0; d < normAxis; ++d)
-      options.push_back({0, d, d});
-    return options;
-  }
 };
 
 //===--------------------- Softmax ---------------------===//
@@ -551,25 +487,6 @@ struct SoftmaxRule final : public SplitRule {
       return failure(); // 정규화되는 축은 나눌 수 없다
     step.results.push_back(SplitState::partitioned(x.axis));
     return step;
-  }
-
-  SmallVector<InputSplitOption, 4> inputSplitOptions(
-      Operation *op) const override {
-    SmallVector<InputSplitOption, 4> options;
-    auto sm = dyn_cast<ONNXSoftmaxOp>(op);
-    if (!sm || isConstantValue(sm.getInput()))
-      return options;
-    auto xShape = getShapeOf(sm.getInput());
-    if (!xShape)
-      return options;
-    int64_t rank = xShape->size();
-    int64_t smAxis = sm.getAxis();
-    if (smAxis < 0)
-      smAxis += rank;
-    for (int64_t d = 1; d < rank; ++d)
-      if (d != smAxis)
-        options.push_back({0, d, d});
-    return options;
   }
 };
 
@@ -613,19 +530,6 @@ struct EltwiseUnaryRule final : public SplitRule {
     OpSplitStep step;
     step.results.push_back(operands[0]);
     return step;
-  }
-
-  SmallVector<InputSplitOption, 4> inputSplitOptions(
-      Operation *op) const override {
-    SmallVector<InputSplitOption, 4> options;
-    if (op->getNumOperands() < 1 || isConstantValue(op->getOperand(0)))
-      return options;
-    auto shape = getShapeOf(op->getOperand(0));
-    if (!shape)
-      return options;
-    for (int64_t d = 0; d < (int64_t)shape->size(); ++d)
-      options.push_back({0, d, d});
-    return options;
   }
 };
 
@@ -688,28 +592,6 @@ struct EltwiseBinaryRule final : public SplitRule {
       return step;
     }
     return failure(); // 분할되지 않은 activation과는 정렬 불가
-  }
-
-  SmallVector<InputSplitOption, 4> inputSplitOptions(
-      Operation *op) const override {
-    SmallVector<InputSplitOption, 4> options;
-    if (op->getNumOperands() != 2 || op->getNumResults() != 1)
-      return options;
-    auto outShape = getShapeOf(op->getResult(0));
-    if (!outShape)
-      return options;
-    int64_t rO = outShape->size();
-    for (unsigned idx = 0; idx < 2; ++idx) {
-      if (isConstantValue(op->getOperand(idx)))
-        continue;
-      auto shape = getShapeOf(op->getOperand(idx));
-      if (!shape)
-        continue;
-      int64_t r = shape->size();
-      for (int64_t d = 0; d < r; ++d)
-        options.push_back({idx, d, d + (rO - r)});
-    }
-    return options;
   }
 };
 

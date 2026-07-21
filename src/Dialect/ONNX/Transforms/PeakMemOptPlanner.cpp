@@ -69,10 +69,9 @@ bool planWalkFrom(Subgraph &sg, unsigned startIdx,
 }
 
 // E의 분할 상태로 병합 방법을 확정하고, 피크 추정과 함께 plan을 완성한다.
-// runtimeSplitInput: input-split일 때 런타임 Split이 꽂히는 입력(없으면 널).
 bool planFinish(Subgraph &sg, Liveness &liveness,
     llvm::DenseMap<Value, SplitState> &states, unsigned nSlices,
-    StringRef seedDesc, Value runtimeSplitInput, SubgraphPlan &plan) {
+    StringRef seedDesc, SubgraphPlan &plan) {
   Operation *s = sg.getS();
   Operation *e = sg.getE();
   const int n = plan.nBranches;
@@ -129,12 +128,6 @@ bool planFinish(Subgraph &sg, Liveness &liveness,
   }
   int64_t carry = (int64_t)(n - 1) * scaledBytes(e->getResult(0));
   int64_t newPeak = branchPeak + carry;
-  // input-split이면 Split 시점에 원본과 조각들이 잠시 공존한다: 2x|X|.
-  if (runtimeSplitInput) {
-    int64_t x = getTensorSize(runtimeSplitInput);
-    if (x > 0)
-      newPeak = std::max(newPeak, 2 * x);
-  }
 
   plan.mergeIsAdd = eState.isReduced();
   plan.mergeAxis = eState.isPartitioned() ? eState.axis : -1;
@@ -178,8 +171,7 @@ std::optional<SubgraphPlan> computePlan(Subgraph &sg, Liveness &liveness) {
     unsigned nSlices = 0;
     if (planApplyStep(s, e, *seed, states, plan, nSlices) &&
         planWalkFrom(sg, 1, states, plan, nSlices) &&
-        planFinish(
-            sg, liveness, states, nSlices, "weight-split", Value(), plan))
+        planFinish(sg, liveness, states, nSlices, "weight-split", plan))
       return plan;
   }
   pmoDbg() << "[planner] invalid: no viable split plan\n";
@@ -225,8 +217,7 @@ std::optional<SubgraphPlan> computeConcatReusePlan(
   unsigned nSlices = 0;
   if (!planWalkFrom(sg, 1, states, plan, nSlices))
     return std::nullopt;
-  if (!planFinish(
-          sg, liveness, states, nSlices, "concat-reuse", Value(), plan))
+  if (!planFinish(sg, liveness, states, nSlices, "concat-reuse", plan))
     return std::nullopt;
   return plan;
 }

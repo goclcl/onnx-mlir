@@ -109,10 +109,6 @@ void executePlan(Subgraph &sg, const SubgraphPlan &plan) {
         partSlices[si].push_back({}); // ApplyOnce: 인덱스 자리 맞춤용
     }
   }
-  SmallVector<Value, 2> seedSlices;
-  if (plan.seedKind == SubgraphPlan::SeedKind::InputSplit)
-    seedSlices = makeSlices(
-        s->getOperand(plan.inputSeed.operandIdx), plan.inputSeed.inAxis);
   Value noneVal; // ApplyOnce의 비-첫 브랜치용 (지연 생성)
 
   // 2. 브랜치 생성
@@ -120,9 +116,7 @@ void executePlan(Subgraph &sg, const SubgraphPlan &plan) {
   SmallVector<Value, 2> branchOuts;
   for (int i = 0; i < n; ++i) {
     IRMapping mapping;
-    if (plan.seedKind == SubgraphPlan::SeedKind::InputSplit)
-      mapping.map(s->getOperand(plan.inputSeed.operandIdx), seedSlices[i]);
-    else if (plan.seedKind == SubgraphPlan::SeedKind::ConcatReuse)
+    if (plan.seedKind == SubgraphPlan::SeedKind::ConcatReuse)
       mapping.map(s->getResult(0), s->getOperand(i));
     for (auto [si, entry] : llvm::enumerate(plan.steps)) {
       Operation *op = entry.first;

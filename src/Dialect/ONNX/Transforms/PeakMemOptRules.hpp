@@ -13,17 +13,14 @@
 //    입력 개수를 그대로 사용한다.
 //  - Reduced(부분합)는 E의 result에서만 허용. 부분합은 브랜치당 풀사이즈라
 //    중간 전파는 live tensor 합을 줄이지 못해 피크 감소 목적에 반한다.
-//  - S를 브랜치별로 나눠 실행하려면 S의 operand 하나를 잘라야 하며,
-//    무엇을 자르느냐로 두 방법이 갈린다. 우선순위:
-//    ① weight-split: S의 "상수" operand(weight/bias)를 자른다. 상수의
-//       Split은 상수폴딩으로 컴파일 타임에 접혀 런타임 오버헤드 0.
-//    ② input-split: S의 "상수가 아닌" 입력(activation)을 자른다. 런타임
-//       onnx.Split(copy) 비용이 있어 weight-split 불가 시의 폴백.
-//    S의 출력을 자르는 방식은 쓰지 않는다 — 출력을 자르면 잘리기 전의
-//    풀사이즈 출력이 그대로 생성되어 피크가 줄지 않는다.
+//  - 시드는 S의 weight-split뿐이다(2026-07-21 결정): S의 "상수" operand
+//    (weight/bias)를 잘라 result를 파티션시킨다. 상수의 Split은 상수폴딩으로
+//    컴파일 타임에 접혀 런타임 오버헤드 0. 후속 연산들은 전파로 쪼개진
+//    입력을 받는다. S의 activation에 런타임 onnx.Split을 꽂는 input-split
+//    시딩과 S의 출력을 자르는 방식은 쓰지 않는다 — 전자는 풀사이즈 copy
+//    비용, 후자는 잘리기 전의 풀사이즈 출력이 그대로 생성되어 피크가
+//    줄지 않는다.
 //  - batch(축 0)는 분할 후보에서 원천 제외.
-//  - input-split 축 선택: 유효 축 중 balance = ceil(d/2)/d 최소
-//    (분할 균형이 좋은 축), 동률이면 바깥쪽(연속 슬랩 → 싼 copy).
 //
 //===----------------------------------------------------------------===//
 
@@ -90,15 +87,6 @@ struct OpSplitStep {
   llvm::SmallVector<SliceReq, 2> slices;
 };
 
-/// inputSplitOptions가 반환하는 후보 하나: "operandIdx번째 입력(상수가 아닌
-/// activation)의 inAxis를 런타임 onnx.Split로 자르면 result의 outAxis가
-/// 파티션된다"는 대응 관계 하나를 서술한다.
-struct InputSplitOption {
-  unsigned operandIdx; // 자를 입력 operand (상수가 아닌 activation만)
-  int64_t inAxis;      // 그 입력 텐서에서의 축
-  int64_t outAxis;     // 그 결과 파티션되는 result의 축 (inAxis와 다를 수 있음)
-};
-
 /// op 하나의 분할 특성. 모든 메서드는 순수(IR 변경 없음) — 유일한 예외인
 /// patchClone도 엔진이 만들어 준 클론의 attribute/보조 상수만 보정한다.
 class SplitRule {
@@ -114,21 +102,11 @@ public:
   /// PLAN(S 전용): 자신의 "상수" operand(weight/bias)를 잘라 result가
   /// 파티션되게 만드는 계획. 유도되는 축은 op가 결정한다(Conv → out-channel,
   /// MatMul → weight의 M/N). 상수의 Split은 상수폴딩으로 접혀 런타임 비용이
-  /// 없으므로 엔진은 항상 이 방법을 먼저 시도한다.
-  /// failure = weight-split 불가 → 엔진이 inputSplitOptions로 폴백.
+  /// 없다. 시드는 이 방법뿐이다(S는 weight-split만 허용).
+  /// failure = weight-split 불가 → 후보 기각.
   virtual mlir::FailureOr<OpSplitStep> planWeightSplit(
       mlir::Operation *op, int nBranches) const {
     return mlir::failure();
-  }
-
-  /// PLAN(S 전용, weight-split 실패 시 폴백): "상수가 아닌" 입력(activation)을
-  /// 잘라 result를 파티션시킬 수 있는 후보 목록. 상수 operand는 후보로 내지
-  /// 않는다(그것은 planWeightSplit의 영역). 규칙은 수학적으로 가능한 후보를
-  /// 나열만 하고, 그중 하나를 고르는 것(batch 제외, balance 최소, 바깥쪽
-  /// 우선)은 엔진의 정책이다.
-  virtual llvm::SmallVector<InputSplitOption, 4> inputSplitOptions(
-      mlir::Operation *op) const {
-    return {};
   }
 
   /// REWRITE: 엔진이 클론과 operand 연결(mapping + 슬라이스 배선)을 끝낸

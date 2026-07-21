@@ -20,23 +20,20 @@ namespace peakmem {
 /// 서브그래프 하나에 대한 실행 가능한 분할 계획. steps는 토폴로지 순서다.
 /// seedKind에 따라:
 ///  - WeightSplit: steps[0] == S (planWeightSplit의 답)
-///  - InputSplit:  steps[0] == S (시드 operand가 파티션된 상태의 propagate 답)
 ///  - ConcatReuse: S(기존 Concat)는 클론하지 않고 지우므로 steps에 없다.
 ///                 브랜치 i의 입력은 S의 i번째 operand.
 struct SubgraphPlan {
-  enum class SeedKind { WeightSplit, InputSplit, ConcatReuse };
+  enum class SeedKind { WeightSplit, ConcatReuse };
   SeedKind seedKind = SeedKind::WeightSplit;
   int nBranches = kNumBranches;
   llvm::SmallVector<std::pair<mlir::Operation *, OpSplitStep>, 8> steps;
-  InputSplitOption inputSeed; // InputSplit일 때만
   bool mergeIsAdd = false;
   int64_t mergeAxis = -1;           // Concat 병합일 때의 축
   int64_t oldPeak = 0, newPeak = 0; // 추정치 (바이트)
 };
 
-/// expand/shrink · fork/join 서브그래프의 계획: weight-split을 먼저 시도하고,
-/// 실패하면 input-split 후보를 batch 제외 + balance(⌈d/2⌉/d) 최소 순으로
-/// 시도한다. IR은 변경하지 않는다.
+/// expand/shrink · fork/join 서브그래프의 계획: S의 weight-split만 시도한다
+/// (S는 weight-split만 허용 — 2026-07-21 결정). IR은 변경하지 않는다.
 std::optional<SubgraphPlan> computePlan(Subgraph &sg, mlir::Liveness &liveness);
 
 /// concat-shrink(merge-shrink) 서브그래프의 계획: 기존 Concat의 입력들을
