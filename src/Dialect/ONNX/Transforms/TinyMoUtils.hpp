@@ -66,6 +66,10 @@ struct SpillCandidate {
   mlir::Operation *fetchBefore = nullptr; // cold range 끝(다음 접근 op)
   int64_t coldLen = 0;                    // op 개수 기준 구간 길이
   int64_t bytes = 0;                      // victim 크기 = 기대 피크 감소량
+  // fetch를 소비자 Concat(2~4입력)과 융합 가능한가. victim이 피크 op에서
+  // 소비되는 경우(skip을 모으는 Concat이 피크인 U-Net류)는 융합일 때만
+  // 피크 감소 효과가 있다 — fetched 텐서가 실체화되지 않기 때문.
+  bool fuse = false;
 };
 
 /// 피크 시점 live 텐서들의 cold range를 계산해 최장 후보를 찾는다.

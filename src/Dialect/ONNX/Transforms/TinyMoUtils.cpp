@@ -3,6 +3,7 @@
 #include "src/Dialect/ONNX/Transforms/TinyMoUtils.hpp"
 
 #include <algorithm>
+#include <cstdio>
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
@@ -396,11 +397,10 @@ std::optional<SpillCandidate> findSpillCandidate(
       continue;
     llvm::sort(accesses);
 
-    // 피크에서 접근 중이면 cold가 아니다.
-    if (llvm::is_contained(accesses, peakIdx))
-      continue;
-
-    // 피크를 포함하는 무접근 구간 [prev, next]
+    // 피크를 포함하거나 피크에서 끝나는 무접근 구간 [prev, next].
+    // next == peakIdx는 피크 op가 이 텐서를 소비하는 경우(skip을 모으는
+    // Concat이 피크인 U-Net류) — fetch-concat 융합이 가능할 때만 피크
+    // 감소 효과가 있으며, 그 판단은 게이트(expectedPeakAfterSpill)가 한다.
     int64_t prev = -1, next = -1;
     for (int64_t a : accesses) {
       if (a < peakIdx)
@@ -413,15 +413,43 @@ std::optional<SpillCandidate> findSpillCandidate(
     if (prev < 0 || next < 0)
       continue; // 피크 앞 정의가 없거나(불가) 이후 사용이 없음(반환값 등)
 
+    Operation *fetchBefore = &*std::next(block->begin(), next);
+    // 융합 가능성: 소비자가 2~4입력 Concat이고, victim의 남은 사용이 그
+    // 소비 딱 한 번이며, 모양이 정적일 때.
+    int64_t lateAccesses = 0;
+    for (int64_t a : accesses)
+      if (a >= next)
+        ++lateAccesses;
+    bool fuse = false;
+    if (lateAccesses == 1) {
+      if (auto concat = llvm::dyn_cast<ONNXConcatOp>(fetchBefore)) {
+        auto outTy = dyn_cast<RankedTensorType>(concat.getResult().getType());
+        auto vicTy = dyn_cast<RankedTensorType>(v.getType());
+        unsigned occurrences = 0;
+        for (Value in : concat.getOperands())
+          if (in == v)
+            ++occurrences;
+        if (occurrences == 1 && concat.getNumOperands() >= 2 &&
+            concat.getNumOperands() <= 4 && outTy && outTy.hasStaticShape() &&
+            vicTy && vicTy.hasStaticShape())
+          fuse = true;
+      }
+    }
+    // 융합이 불가능한데 구간이 피크에서 끝나면(피크 op가 소비) 피크 감소
+    // 효과가 없다 — 후보에서 제외.
+    if (next == peakIdx && !fuse)
+      continue;
+
     int64_t coldLen = next - prev;
     if (!best || coldLen > best->coldLen ||
         (coldLen == best->coldLen && bytes > best->bytes)) {
       SpillCandidate cand;
       cand.victim = v;
       cand.spillAfter = &*std::next(block->begin(), prev);
-      cand.fetchBefore = &*std::next(block->begin(), next);
+      cand.fetchBefore = fetchBefore;
       cand.coldLen = coldLen;
       cand.bytes = bytes;
+      cand.fuse = fuse;
       best = cand;
     }
   }
@@ -430,10 +458,12 @@ std::optional<SpillCandidate> findSpillCandidate(
 
 int64_t expectedPeakAfterSpill(
     func::FuncOp funcOp, Liveness &liveness, const SpillCandidate &cand) {
+  // 융합이면 victim이 소비 op(fetchBefore)에서도 실체화되지 않으므로
+  // 감산 구간이 fetchBefore까지 포함된다.
   int64_t newPeak = 0;
   bool inside = false;
   for (Operation &op : funcOp.getBody().front()) {
-    if (&op == cand.fetchBefore)
+    if (&op == cand.fetchBefore && !cand.fuse)
       inside = false;
     if (isa<ONNXConstantOp>(&op)) {
       if (&op == cand.spillAfter)
@@ -446,6 +476,8 @@ int64_t expectedPeakAfterSpill(
     newPeak = std::max(newPeak, usage);
     if (&op == cand.spillAfter)
       inside = true;
+    if (&op == cand.fetchBefore)
+      inside = false;
   }
   return newPeak;
 }
@@ -503,30 +535,38 @@ bool applyTensorSpilling(
   if (lateUses.empty())
     return false; // 있을 수 없는 상황 — 후보 조건상 다음 접근이 존재
 
-  // 2-a. fetch-concat 융합 (논문 Fig. 4(c)): 다음 접근이 2-입력 Concat이고
+  // 2-a. fetch-concat 융합 (논문 Fig. 4(c)): 소비자가 2~4입력 Concat이고
   //      그것이 victim의 유일한 이후 사용일 때, fetched 텐서를 실체화하지
-  //      않고 concat 결과에 바로 쓴다.
-  if (lateUses.size() == 1) {
+  //      않고 concat 결과에 바로 쓴다 (om_fetch_concat<N>).
+  if (cand.fuse && lateUses.size() == 1) {
     if (auto concat =
             llvm::dyn_cast<ONNXConcatOp>(lateUses[0]->getOwner())) {
       auto outTy = dyn_cast<RankedTensorType>(concat.getResult().getType());
-      auto vicTy = dyn_cast<RankedTensorType>(victim.getType());
-      if (concat == cand.fetchBefore && concat.getNumOperands() == 2 &&
-          outTy && outTy.hasStaticShape() && vicTy && vicTy.hasStaticShape()) {
+      unsigned arity = concat.getNumOperands();
+      if (concat == cand.fetchBefore && arity >= 2 && arity <= 4 && outTy) {
         int64_t axis = concat.getAxis();
         if (axis < 0)
           axis += outTy.getRank();
-        int64_t fetchPos = (concat.getOperand(0) == victim) ? 0 : 1;
-        Value other = concat.getOperand(fetchPos == 0 ? 1 : 0);
+        int64_t fetchPos = -1;
+        SmallVector<Value, 4> others;
+        for (auto [i, in] : llvm::enumerate(concat.getOperands())) {
+          if (in == victim)
+            fetchPos = (int64_t)i;
+          else
+            others.push_back(in);
+        }
+        char fname[24];
+        snprintf(fname, sizeof(fname), "om_fetch_concat%u", arity);
+        others.push_back(token);
         builder.setInsertionPoint(concat);
         SmallVector<NamedAttribute, 4> fusedAttrs{
             builder.getNamedAttr("axis", si64(axis)),
             builder.getNamedAttr("fetch_pos", si64(fetchPos)),
-            builder.getNamedAttr("function_name",
-                builder.getStringAttr("om_fetch_concat2")),
+            builder.getNamedAttr(
+                "function_name", builder.getStringAttr(fname)),
             builder.getNamedAttr("spill_id", si64(spillId))};
         auto fused = builder.create<ONNXCustomOp>(loc,
-            TypeRange{concat.getResult().getType()}, ValueRange{other, token},
+            TypeRange{concat.getResult().getType()}, ValueRange(others),
             fusedAttrs);
         concat.getResult().replaceAllUsesWith(fused.getResult(0));
         concat.getOperation()->erase();

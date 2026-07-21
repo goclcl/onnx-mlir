@@ -69,28 +69,26 @@ void om_fetch(OMTensor *output, OMTensor *token, int64_t spillId) {
 }
 
 /*
- * fetch + 2입력 Concat 융합: fetched 텐서를 실체화하지 않고 concat 결과에
- * 바로 쓴다. axis 앞쪽 차원들을 outer로 접어, outer 조각마다
- * [operand0 행 | operand1 행]을 이어 붙인다. fetchPos = fetched 텐서가
- * concat의 몇 번째 입력이었는지(0|1). 파일은 victim의 연속 레이아웃이므로
- * outer 오름차순 순회로 순차 read 한다.
+ * fetch + Concat 융합 (2~4입력): fetched 텐서를 실체화하지 않고 concat
+ * 결과에 바로 쓴다. axis 앞쪽 차원들을 outer로 접어, outer 조각마다
+ * [part0 | part1 | ...] 을 이어 붙인다. fetchPos 파트는 파일에서 순차
+ * read하고(파일 = victim의 연속 레이아웃, outer 오름차순 순회와 일치),
+ * 나머지 파트는 others[k]에서 복사한다. others = 원래 concat 순서에서
+ * victim을 뺀 순서.
  */
-void om_fetch_concat2(OMTensor *output, OMTensor *other, OMTensor *token,
-    int64_t axis, int64_t fetchPos, int64_t spillId) {
-  (void)token;
+static void omFetchConcatImpl(OMTensor *out, OMTensor **others,
+    int64_t nOthers, int64_t axis, int64_t fetchPos, int64_t spillId) {
   char path[512];
   omSpillPath(path, sizeof(path), spillId);
   FILE *f = fopen(path, "rb");
   if (!f) {
-    fprintf(stderr, "om_fetch_concat2: cannot open %s\n", path);
+    fprintf(stderr, "om_fetch_concat: cannot open %s\n", path);
     abort();
   }
 
-  const int64_t *outShape = omTensorGetShape(output);
-  const int64_t *otherShape = omTensorGetShape(other);
-  int64_t rank = omTensorGetRank(output);
-  int64_t elemSize =
-      omTensorGetBufferSize(output) / omTensorGetNumElems(output);
+  const int64_t *outShape = omTensorGetShape(out);
+  int64_t rank = omTensorGetRank(out);
+  int64_t elemSize = omTensorGetBufferSize(out) / omTensorGetNumElems(out);
 
   int64_t outer = 1;
   for (int64_t d = 0; d < axis; ++d)
@@ -99,23 +97,59 @@ void om_fetch_concat2(OMTensor *output, OMTensor *other, OMTensor *token,
   for (int64_t d = axis + 1; d < rank; ++d)
     inner *= outShape[d];
 
-  int64_t otherRow = otherShape[axis] * inner;
-  int64_t fetchRow = (outShape[axis] - otherShape[axis]) * inner;
+  int64_t nParts = nOthers + 1;
+  int64_t widths[4];
+  int64_t sumOthers = 0;
+  for (int64_t p = 0, oi = 0; p < nParts; ++p) {
+    if (p == fetchPos)
+      continue;
+    widths[p] = omTensorGetShape(others[oi])[axis] * inner;
+    sumOthers += widths[p];
+    ++oi;
+  }
+  int64_t rowTotal = outShape[axis] * inner;
+  widths[fetchPos] = rowTotal - sumOthers;
 
-  char *out = (char *)omTensorGetDataPtr(output);
-  const char *oth = (const char *)omTensorGetDataPtr(other);
-
+  char *outp = (char *)omTensorGetDataPtr(out);
   for (int64_t o = 0; o < outer; ++o) {
-    char *dst = out + o * (otherRow + fetchRow);
-    char *fetchDst = (fetchPos == 0) ? dst : dst + otherRow;
-    char *otherDst = (fetchPos == 0) ? dst + fetchRow : dst;
-    memcpy(otherDst, oth + o * otherRow, (size_t)otherRow);
-    if (fread(fetchDst, 1, (size_t)fetchRow, f) != (size_t)fetchRow) {
-      fprintf(stderr, "om_fetch_concat2: short read from %s\n", path);
-      abort();
+    char *dst = outp + o * rowTotal;
+    int64_t off = 0;
+    for (int64_t p = 0, oi = 0; p < nParts; ++p) {
+      if (p == fetchPos) {
+        if (fread(dst + off, 1, (size_t)widths[p], f) != (size_t)widths[p]) {
+          fprintf(stderr, "om_fetch_concat: short read from %s\n", path);
+          abort();
+        }
+      } else {
+        const char *src = (const char *)omTensorGetDataPtr(others[oi]);
+        memcpy(dst + off, src + o * widths[p], (size_t)widths[p]);
+        ++oi;
+      }
+      off += widths[p];
     }
   }
   fclose(f);
+}
+
+void om_fetch_concat2(OMTensor *out, OMTensor *o1, OMTensor *token,
+    int64_t axis, int64_t fetchPos, int64_t spillId) {
+  (void)token;
+  OMTensor *others[1] = {o1};
+  omFetchConcatImpl(out, others, 1, axis, fetchPos, spillId);
+}
+
+void om_fetch_concat3(OMTensor *out, OMTensor *o1, OMTensor *o2,
+    OMTensor *token, int64_t axis, int64_t fetchPos, int64_t spillId) {
+  (void)token;
+  OMTensor *others[2] = {o1, o2};
+  omFetchConcatImpl(out, others, 2, axis, fetchPos, spillId);
+}
+
+void om_fetch_concat4(OMTensor *out, OMTensor *o1, OMTensor *o2, OMTensor *o3,
+    OMTensor *token, int64_t axis, int64_t fetchPos, int64_t spillId) {
+  (void)token;
+  OMTensor *others[3] = {o1, o2, o3};
+  omFetchConcatImpl(out, others, 3, axis, fetchPos, spillId);
 }
 
 #ifdef __cplusplus
