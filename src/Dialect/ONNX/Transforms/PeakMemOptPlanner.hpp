@@ -29,7 +29,11 @@ struct SubgraphPlan {
   llvm::SmallVector<std::pair<mlir::Operation *, OpSplitStep>, 8> steps;
   bool mergeIsAdd = false;
   int64_t mergeAxis = -1;           // Concat 병합일 때의 축
-  int64_t oldPeak = 0, newPeak = 0; // 추정치 (바이트)
+  int64_t oldPeak = 0, newPeak = 0; // 전역 추정치 (바이트, 참고용)
+  /// benefit analysis (논문 §3.3) 결과: 영역-국소 모델의 기대 피크 감소
+  /// = M_p − max{조건별 LHS}. 조건 하나라도 위배되면 후보 자체가 기각되므로
+  /// 유효 plan에서는 항상 > 0.
+  int64_t benefitReduction = 0;
 };
 
 /// expand/shrink · fork/join 서브그래프의 계획: S의 weight-split만 시도한다

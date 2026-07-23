@@ -152,15 +152,15 @@ struct PeakMemOptPass
     for (Candidate &c : llvm::drop_begin(candidates)) {
       size_t nBest = best->sg->subgraphNodes.size();
       size_t nC = c.sg->subgraphNodes.size();
-      int64_t rBest = best->plan.oldPeak - best->plan.newPeak;
-      int64_t rC = c.plan.oldPeak - c.plan.newPeak;
+      int64_t rBest = best->plan.benefitReduction;
+      int64_t rC = c.plan.benefitReduction;
       if (nC < nBest || (nC == nBest && rC > rBest))
         best = &c;
     }
     pmoDbg() << "[select] " << candidates.size() << " candidate(s) -> "
              << best->kind << " (" << best->sg->subgraphNodes.size()
-             << " nodes, est. reduction "
-             << (best->plan.oldPeak - best->plan.newPeak) << "B)\n";
+             << " nodes, est. reduction " << best->plan.benefitReduction
+             << "B)\n";
 
     executePlan(*best->sg, best->plan);
     return true;
